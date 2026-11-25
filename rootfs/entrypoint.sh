@@ -212,6 +212,8 @@ mkfifo -m 0600 "$FIFO"
 watch_log < "$FIFO" &
 WATCH_PID=$!
 
+# 이전에 받은 서버 설정이 남아 있지 않게 접속 전에 비운다(재시작 줄에서도 비운다).
+rm -f "$STATE_DIR/pushed-dns" "$STATE_DIR/pushed-domains"
 set_state connecting "VPN 서버에 접속 중"
 log "OpenVPN 시작: $(basename "$SRC_CONFIG")"
 openvpn "$@" > "$FIFO" 2>&1 &

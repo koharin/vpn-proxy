@@ -233,11 +233,18 @@ OpenVPN 은 이런 글자를 공백처럼 건너뛰기도 해서, 검사와 Open
 닫는 표시는 OpenVPN 과 같은 기준으로 본다: 앞 공백을 뺀 줄이 `</이름>` 으로 시작하면 닫는 것이고,
 그 줄에 다른 글자가 더 있으면(`</ca>x`) 멈춘다.
 
+**4. 파일 경로** — `ca` `cert` `key` `extra-certs` `pkcs12` `dh` `crl-verify` `tls-auth` `tls-crypt`
+`tls-crypt-v2` `auth-user-pass` 뒤의 파일 경로는 ovpn 폴더 안의 상대 경로만 받는다(`ca ca.crt`, `cert certs/client.crt`).
+`/` 로 시작하거나 `..` 이 들어 있거나 따옴표·역슬래시·공백이 든 경로는 멈춘다. 컨테이너 안의 다른 파일을
+읽어 서버로 보내게 하는 것을 막기 위함이다. 인증서를 ovpn 안에 `<ca>…</ca>` 블록으로 넣는 것과,
+경로 없는 `auth-user-pass`(같은 폴더의 `auth.txt` 사용)는 그대로 된다.
+
 **회사에서 받은 ovpn 이 거부되면** 로그에 찍힌 줄을 지운다. 흔한 경우:
 
 - `up /etc/openvpn/update-resolv-conf`, `down …`, `script-security 2` → 지운다. DNS 는 이 구성이 대신 설정한다.
 - `log`, `status`, `writepid` → 지운다. 로그는 `docker compose logs` 로 본다.
 - 한글 주석 → 지우거나 영어로 바꾼다.
+- `ca /etc/openvpn/ca.crt` 같은 절대 경로 → 그 파일을 ovpn 과 같은 폴더에 두고 `ca ca.crt` 로 바꾼다.
 - 꼭 필요한 지시가 목록에 없으면 `rootfs/check-ovpn.sh` 의 목록에 더하고 다시 빌드한다(더하기 전에 그 지시가
   명령 실행·파일 쓰기를 하지 않는지 OpenVPN 문서로 확인한다).
 
@@ -269,6 +276,10 @@ docker exec vpn-proxy-a cat /run/vpn/status.json    # 한 줄 JSON
 
 `gen` 은 터널이 올라온 횟수다. 컨테이너가 떠 있지 않으면 이 파일도 없으므로 `docker compose ps` 를 함께 본다.
 `docker compose ps` 의 healthy 는 `state` 가 `up` 이고 SOCKS 포트가 열려 있다는 뜻이다.
+
+상태는 OpenVPN 로그의 줄 전체 모양으로 판단한다. 시각 뒤가 정확히 `Initialization Sequence Completed` 인 줄만
+연결됨으로, `SIG…[…] received, process restarting|exiting` 인 줄만 내려감으로 본다. 서버 인증서 이름처럼
+상대가 정한 글이 로그 줄 중간에 찍혀도 상태는 바뀌지 않는다.
 
 ## 점검 스크립트
 

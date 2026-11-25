@@ -76,7 +76,7 @@ out=$($DOCKER run --rm --name vpn-proxy-test-nocap --cap-drop ALL --tmpfs /run -
 if [ $rc -ne 0 ] && echo "$out" | grep -Eq "/dev/net/tun|방화벽"; then ok "권한·장치 없음 → 시작하지 않음(종료 코드 $rc)"; else bad "권한 없음: rc=$rc out=$out"; fi
 
 # 192.0.2.1 은 문서용 주소라 응답이 없다. 인증서 파일이 없어 OpenVPN 이 시작에 실패한다.
-printf 'client\ndev tun\nremote 192.0.2.1 1194 udp\nca /nonexistent-on-purpose.crt\n' > "$TMP/dead/client.ovpn"
+printf 'client\ndev tun\nremote 192.0.2.1 1194 udp\nca nonexistent-on-purpose.crt\n' > "$TMP/dead/client.ovpn"
 run_once dead "$TMP/dead"
 if [ $rc -ne 0 ] && echo "$out" | grep -q "연결 전에 끝났습니다"; then ok "OpenVPN 이 시작에 실패 → 종료 코드 $rc, 안내 문구"; else bad "OpenVPN 실패: rc=$rc out=$out"; fi
 
@@ -144,6 +144,23 @@ reject "대문자 블록 <CA>"                  "$BASE"'<CA>\nroute-up '"$CMD"'\
 reject "닫히지 않은 블록"                  "$BASE"'<ca>\nMIIB\nroute-up /bin/true\n'
 reject "닫히지 않은 <connection>"          "$BASE"'<connection>\nremote 192.0.2.1\n'
 
+# 3-f) 파일 경로 인자는 ovpn 폴더 안으로 제한 (보안 검토 L3)
+reject "ca /etc/shadow(절대 경로)"          "$BASE"'ca /etc/shadow\n'
+reject "auth-user-pass /proc/1/environ"     "$BASE"'auth-user-pass /proc/1/environ\n'
+reject "tls-crypt /run/vpn/client.ovpn"     "$BASE"'tls-crypt /run/vpn/client.ovpn\n'
+reject "cert ../../etc/passwd(.. 로 벗어남)" "$BASE"'cert ../../etc/passwd\n'
+reject "key sub/../../etc/passwd"           "$BASE"'key sub/../../etc/passwd\n'
+reject "따옴표로 감싼 절대 경로"            "$BASE"'ca "/etc/shadow"\n'
+reject "역슬래시를 넣은 절대 경로"          "$BASE"'ca \\\\/etc/shadow\n'
+reject "탭으로 띄운 절대 경로"              "$BASE"'tls-auth\t/etc/shadow 1\n'
+reject "setenv opt 로 감싼 절대 경로"       "$BASE"'setenv opt ca /etc/shadow\n'
+reject "<connection> 안의 절대 경로"        "$BASE"'<connection>\nremote 192.0.2.1 1194 udp\n</connection>\npkcs12 /etc/shadow\n'
+reject "crl-verify /etc dir"                "$BASE"'crl-verify /etc dir\n'
+# 폴더 안의 상대 경로와 인라인 블록은 검사를 지나간다(검사 스크립트만 따로 실행).
+printf "$BASE"'ca ca.crt\ncert certs/client.crt\nkey certs/client.key\ntls-auth ta.key 1\ntls-crypt tc.key\nauth-user-pass\nauth-user-pass login.txt\ndh none\ncrl-verify crl.pem\n<ca>\n/etc/shadow\n</ca>\n<tls-crypt>\nx\n</tls-crypt>\n' > "$TMP/okcfg/paths.ovpn"
+if o=$($DOCKER run --rm --name vpn-proxy-test-paths --entrypoint check-ovpn.sh -v "$TMP/okcfg:/vpn:ro" $IMAGE /vpn/paths.ovpn 2>&1); then ok "폴더 안 상대 경로·인라인 블록·인자 없는 auth-user-pass·dh none 은 통과"; else bad "정상 경로가 막힘: $o"; fi
+rm -f "$TMP/okcfg/paths.ovpn"
+
 # 3-e) 정상 ovpn 은 검사를 지나가야 한다: 주석, CRLF, 인증서 블록 안의 글자, 흔한 클라이언트 지시.
 printf 'client\r\ndev tun\r\nproto udp\r\nremote 192.0.2.1 1194\r\nresolv-retry infinite\r\nnobind\r\npersist-key\r\npersist-tun\r\nremote-cert-tls server\r\ncipher AES-256-GCM\r\ndata-ciphers AES-256-GCM:AES-128-GCM\r\nauth SHA256\r\nverb 3\r\nkey-direction 1\r\nsetenv opt block-outside-dns\r\nsetenv CLIENT_CERT 0\r\ndhcp-option DNS 10.8.0.1\r\nredirect-gateway def1\r\n# comment up\r\n;route-up comment\r\n<ca>\r\ndown\r\nplugin\r\n  </ca>  \r\n<connection>\r\nremote 192.0.2.1 443 tcp\r\n</connection>\r\n' > "$TMP/okcfg/client.ovpn"
 run_once okcfg "$TMP/okcfg"
@@ -168,21 +185,51 @@ mkdir -p $STATE_DIR; echo 0 > $STATE_DIR/gen; : > $RESOLV_CONF
 . /usr/local/lib/vpn-lib.sh
 set_state connecting x
 # 접속 완료 문구가 서버가 내려 준 글 안에 섞여 있어도 '올라옴'으로 보지 않는다.
-printf '%s\n' "t PUSH: Received control message: 'PUSH_REPLY,echo Initialization Sequence Completed,dhcp-option DNS 10.8.0.1'" | watch_log >/dev/null
+printf '%s\n' "2026-01-02 03:04:05 PUSH: Received control message: 'PUSH_REPLY,echo Initialization Sequence Completed,dhcp-option DNS 10.8.0.1'" | watch_log >/dev/null
 echo "A=$(cat $STATE_DIR/state)"
 rm -f $STATE_DIR/pushed-dns
 printf '%s\n' \
-  "t PUSH: Received control message: 'PUSH_REPLY,redirect-gateway def1,dhcp-option DNS 10.8.0.1,dhcp-option DNS 127.0.0.11,dhcp-option DNS 1.1.1.1;reboot,dhcp-option DNS \$(reboot),dhcp-option DOMAIN corp.internal,dhcp-option DOMAIN bad;name,route 10.8.0.1,ping 10'" \
-  "t Initialization Sequence Completed" | watch_log >/dev/null
+  "2026-01-02 03:04:05 PUSH: Received control message: 'PUSH_REPLY,redirect-gateway def1,dhcp-option DNS 10.8.0.1,dhcp-option DNS 127.0.0.11,dhcp-option DNS 1.1.1.1;reboot,dhcp-option DNS \$(reboot),dhcp-option DOMAIN corp.internal,dhcp-option DOMAIN bad;name,route 10.8.0.1,ping 10'" \
+  "2026-01-02 03:04:05 Initialization Sequence Completed" | watch_log >/dev/null
 echo "B=$(cat $STATE_DIR/state) gen=$(cat $STATE_DIR/gen)"
 echo "C=$(tr '\n' '|' < $RESOLV_CONF)"
 echo "D=$(cat $STATE_DIR/status.json)"
-printf '%s\n' "t SIGUSR1[soft,ping-restart] received, process restarting" | watch_log >/dev/null
+printf '%s\n' "2026-01-02 03:04:05 SIGUSR1[soft,ping-restart] received, process restarting" | watch_log >/dev/null
 echo "E=$(cat $STATE_DIR/state) dns=$(grep -c nameserver $RESOLV_CONF)"
 # 지정한 DNS(VPN_DNS)가 있으면 서버가 내려 준 것보다 먼저다.
 FIXED_DNS=" 10.7.7.7"
-printf '%s\n' "t PUSH: Received control message: 'PUSH_REPLY,dhcp-option DNS 10.8.0.1'" "t Initialization Sequence Completed" | watch_log >/dev/null
+printf '%s\n' "2026-01-02 03:04:05 PUSH: Received control message: 'PUSH_REPLY,dhcp-option DNS 10.8.0.1'" "2026-01-02 03:04:05 Initialization Sequence Completed" | watch_log >/dev/null
 echo "F=$(tr '\n' '|' < $RESOLV_CONF)"
+# L1: 줄 전체 모양이 아니면 반응하지 않는다. 상대가 정한 글(인증서 이름)이 로그 줄 중간에 찍히는 경우.
+FIXED_DNS=""; FILE_DNS=""; echo 0 > $STATE_DIR/gen; rm -f $STATE_DIR/pushed-dns $STATE_DIR/pushed-domains; : > $RESOLV_CONF
+set_state connecting x
+printf '%s\n' \
+  "T VERIFY ERROR: depth=0, error=self-signed certificate: CN=Initialization Sequence Completed, serial=1" \
+  "T VERIFY ERROR: depth=0, error=x: O=PUSH: Received control message:, CN=PUSH_REPLY,dhcp-option DNS 10.66.66.66,x" \
+  "T VERIFY OK: depth=0, CN=x PUSH: Received control message: 'PUSH_REPLY,dhcp-option DNS 10.66.66.67'" \
+  "T Initialization Sequence Completed " \
+  "T Initialization Sequence Completed With Errors" \
+  " T Initialization Sequence Completed" \
+  "Initialization Sequence Completed" \
+  "t Initialization Sequence Completed" \
+  "T  Initialization Sequence Completed" | sed 's/^T /2026-01-02 03:04:05 /; s/^ T / 2026-01-02 03:04:05 /' | watch_log >/dev/null
+echo "G=$(cat $STATE_DIR/state) gen=$(cat $STATE_DIR/gen) pushed=$(cat $STATE_DIR/pushed-dns 2>/dev/null | tr '\n' ' ')"
+set_state up x
+printf '%s\n' \
+  "T VERIFY ERROR: depth=0, error=x: CN=process restarting" \
+  "T VERIFY ERROR: CN=SIGUSR1[soft,x] received, process restarting" \
+  "T SIGUSR1[soft,x] received, process restarting now" \
+  "T SIG x received, process exiting" \
+  "T SIGcn=a b[soft] received, process restarting" | sed 's/^T /2026-01-02 03:04:05 /' | watch_log >/dev/null
+echo "H=$(cat $STATE_DIR/state)"
+printf '%s\n' "2026-01-02 03:04:05 SIGTERM[hard,] received, process exiting" | watch_log >/dev/null
+echo "I=$(cat $STATE_DIR/state)"
+# L2: 쉼표로 나눈 조각의 '*' 가 현재 폴더의 파일 이름으로 바뀌지 않는다.
+mkdir -p /tmp/glob; cd /tmp/glob; touch 'dhcp-option DNS 9.9.9.9' a b
+rm -f $STATE_DIR/pushed-dns
+printf '%s\n' "2026-01-02 03:04:05 PUSH: Received control message: 'PUSH_REPLY,dhcp-option DNS *,*,dhcp-option DNS 10.8.0.2'" | watch_log >/dev/null
+echo "J=$(tr '\n' ' ' < $STATE_DIR/pushed-dns)"
+case $- in *f*) echo "K=noglob-left-on" ;; *) echo "K=glob-restored" ;; esac
 EOS
 u=$($DOCKER run --rm --name vpn-proxy-test-unit --tmpfs /tmp --entrypoint sh -v "$TMP/unit.sh:/unit.sh:ro" $IMAGE /unit.sh 2>&1)
 chk() { if echo "$u" | grep -qxF "$1"; then ok "$2"; else bad "$2 → $(echo "$u" | tr '\n' ' ')"; fi; }
@@ -192,6 +239,11 @@ chk "C=nameserver 10.8.0.1|nameserver 10.9.9.9|search corp.internal|" "내려 �
 if echo "$u" | grep -q '^D={"name":"t","state":"up","since":"[0-9T:Z-]*","gen":1,"dns":\["10.8.0.1","10.9.9.9"\],"socks_port":1080,"message":"터널 연결됨"}$'; then ok "status.json 한 줄 JSON(name·state·since·gen·dns·socks_port·message)"; else bad "status.json 형식: $(echo "$u" | grep '^D=')"; fi
 chk "E=reconnecting dns=0" "재시작 줄에서 상태 reconnecting, DNS 비움"
 chk "F=nameserver 10.7.7.7|" "VPN_DNS 가 있으면 그것만 씀"
+chk "G=connecting gen=0 pushed=" "L1: 인증서 이름 등 줄 중간의 '접속 완료'·PUSH 문구, 모양이 다른 줄로는 상태·DNS 가 바뀌지 않음"
+chk "H=up" "L1: 줄 중간의 '재시작' 문구, 모양이 다른 재시작 줄로는 내려감 처리가 되지 않음"
+chk "I=reconnecting" "L1: 실제 종료 줄(SIGTERM[hard,] received, process exiting)은 내려감으로 처리"
+chk "J=10.8.0.2 " "L2: PUSH_REPLY 의 '*' 가 파일 이름으로 바뀌지 않음"
+chk "K=glob-restored" "L2: 이름 확장은 반복문 뒤에 다시 켜짐"
 
 echo "6) 시험용 터널(상대 컨테이너와 1:1, 암호·비밀값 없음)"
 $DOCKER network create "$NET" >/dev/null

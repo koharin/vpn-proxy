@@ -74,18 +74,28 @@ apply_dns() {
 clear_dns() { echo "# 터널이 내려감: 이름 해석을 하지 않는다" > "$RESOLV_CONF" 2>/dev/null || true; }
 
 # OpenVPN 의 로그를 한 줄씩 읽어 그대로 내보내면서 터널 상태를 따라간다(훅 스크립트 대신).
-#   접속 완료  "Initialization Sequence Completed"       → DNS 적용, gen+1, state=up
-#   재시작·종료 "process restarting" / "process exiting" → state=reconnecting, SOCKS5 즉시 종료, DNS 비움
-#   서버가 내려 준 설정 "PUSH: Received control message"  → DNS 주소만 골라 둔다
+# 줄 "전체"의 모양이 맞을 때만 반응한다. 줄은 "YYYY-MM-DD HH:MM:SS " 로 시작하고, 그 뒤가
+#   접속 완료   정확히 "Initialization Sequence Completed"                → DNS 적용, gen+1, state=up
+#   재시작·종료 정확히 "SIG…[…] received, process restarting|exiting"     → state=reconnecting, SOCKS5 즉시 종료, DNS 비움
+#   내려 준 설정 "PUSH: Received control message: 'PUSH_REPLY," 로 시작    → DNS 주소만 골라 둔다
+# 인 줄만 받는다. 줄 중간에 같은 글이 들어 있는 것은 무시한다 — 상대가 정한 글(인증서 이름 등)이
+# 로그에 그대로 찍히므로, "어디에든 들어 있으면"으로 맞추면 인증되지 않은 상대가 상태를 바꿀 수 있다.
 # 로그의 글은 판단에만 쓰고 명령으로 실행하지 않는다. 서버가 내려 준 값은 형식을 확인한 것만 쓴다.
+PUSH_HEAD="PUSH: Received control message: 'PUSH_REPLY,"
 watch_log() {
   while IFS= read -r line; do
     printf '%s\n' "$line"
     case "$line" in
-      *"PUSH: Received control message:"*)
-        body="${line#*PUSH_REPLY,}"
-        body="${body%\'*}"
+      [0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]\ [0-9][0-9]:[0-9][0-9]:[0-9][0-9]\ *) msg="${line#??????????????????? }" ;;
+      *) continue ;;
+    esac
+    case "$msg" in
+      "$PUSH_HEAD"*)
+        body="${msg#"$PUSH_HEAD"}"
+        body="${body%\'}"
+        # 쉼표로 나눌 때 '*' 같은 글자가 파일 이름으로 바뀌지 않게 이름 확장을 끈다.
         old_ifs="$IFS"; IFS=,
+        set -f
         for item in $body; do
           case "$item" in
             "dhcp-option DNS "*) v="${item#dhcp-option DNS }"; ok_dns "$v" && echo "$v" >> "$STATE_DIR/pushed-dns" ;;
@@ -93,15 +103,17 @@ watch_log() {
             "dhcp-option DOMAIN-SEARCH "*) v="${item#dhcp-option DOMAIN-SEARCH }"; echo "$v" | grep -Eq '^[A-Za-z0-9._-]+$' && echo "$v" >> "$STATE_DIR/pushed-domains" ;;
           esac
         done
+        set +f
         IFS="$old_ifs"
         ;;
-      *"process restarting"*|*"process exiting"*)
+      SIG*" received, process restarting"|SIG*" received, process exiting")
+        printf '%s\n' "$msg" | grep -Eq '^SIG[A-Z0-9]+\[[a-z0-9,-]*\] received, process (restarting|exiting)$' || continue
         set_state reconnecting "터널이 내려갔습니다"
         pids=$(pidof sockd 2>/dev/null) && kill $pids 2>/dev/null
         clear_dns
         rm -f "$STATE_DIR/pushed-dns" "$STATE_DIR/pushed-domains"
         ;;
-      *"Initialization Sequence Completed"*)
+      "Initialization Sequence Completed")
         if apply_dns; then
           gen=$(cat "$STATE_DIR/gen" 2>/dev/null || echo 0)
           echo $((gen + 1)) > "$STATE_DIR/gen"
@@ -114,4 +126,3 @@ watch_log() {
     esac
   done
 }
-

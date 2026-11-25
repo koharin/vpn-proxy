@@ -14,6 +14,11 @@
 #   3. 블록: <ca> 같은 인라인 블록은 허용 목록의 이름만 받는다. 닫는 표시는 OpenVPN 과 같은 기준으로
 #      본다 — 앞 공백을 뺀 줄이 '</이름>' 으로 시작하면 닫는 것이다. 그런 줄이 정확히 '</이름>' 이
 #      아니면(뒤에 다른 글자가 있으면) 멈춘다.
+#   4. 파일 경로: ca·cert·key·tls-crypt·auth-user-pass 처럼 파일을 읽는 지시의 경로는 ovpn 폴더 안의
+#      것만 받는다 — '/' 로 시작하지 않고 '..' 이 없고, 글자·숫자·'.'·'_'·'-'·'/' 로만 된 상대 경로.
+#      따옴표·역슬래시·공백이 든 경로는 받지 않는다(OpenVPN 이 풀어 읽는 방식과 어긋날 틈을 없앤다).
+#      컨테이너 안의 다른 파일(/proc/1/environ 등)을 읽어 서버로 보내게 하지 못하게 한다.
+#      인증서를 ovpn 안에 <ca>…</ca> 블록으로 넣는 것은 그대로 된다.
 set -u
 PATH=/usr/sbin:/usr/bin:/sbin:/bin
 export LC_ALL=C
@@ -61,6 +66,9 @@ awk '
     for (i = 1; i <= n; i++) inline_ok[b[i]] = 1
     n = split("CLIENT_CERT FRIENDLY_NAME GENERIC_CONFIG FORWARD_COMPATIBLE PUSH_PEER_INFO", c, " ")
     for (i = 1; i <= n; i++) env_ok[c[i]] = 1
+    # 첫 인자가 파일 경로인 지시.
+    n = split("ca cert key extra-certs pkcs12 dh crl-verify tls-auth tls-crypt tls-crypt-v2 auth-user-pass", d, " ")
+    for (i = 1; i <= n; i++) path_arg[d[i]] = 1
     skip = ""; skip_from = 0; in_conn = 0; rc = 0
   }
   function report(why) { printf "  %d번째 줄: %s\n", NR, why; rc = 1 }
@@ -86,6 +94,14 @@ awk '
       return
     }
     if (!(word in allowed)) { report("받지 않는 지시 \"" word "\""); return }
+    if (word in path_arg && rest != "") {
+      name = rest; sub(/[ \t].*$/, "", name)
+      # dh none 은 파일이 아니라 "쓰지 않음"이다.
+      if (!(word == "dh" && name == "none")) {
+        if (name !~ /^[A-Za-z0-9._-]+(\/[A-Za-z0-9._-]+)*$/ || name ~ /(^|\/)\.\.(\/|$)/)
+          report("\"" word "\" 의 파일 경로는 ovpn 폴더 안의 상대 경로만 받습니다(/ 로 시작, .., 따옴표, 역슬래시 불가). 파일을 같은 폴더에 두고 이름만 적으세요")
+      }
+    }
     # DNS 를 컨테이너 자신(127.x)이나 0.x 로 돌리면 터널 밖(Docker DNS)으로 이름을 묻게 된다.
     if (word == "dhcp-option" && rest ~ /^DNS[ \t]+(127\.|0\.|::|localhost)/) report("dhcp-option DNS 에 이 주소는 쓸 수 없습니다")
   }
