@@ -31,7 +31,8 @@ Mac 에는 VPN 을 켜지 않는다. VPN마다 컨테이너 하나(OpenVPN 클�
 - **방화벽**: 나가는 길은 터널(`tun0`)과 VPN 서버 주소뿐이다. 터널이 없으면 아무 데도 못 나간다.
 - **kill-switch**: 터널이 내려가면 SOCKS5 를 끄고, 다시 올라오면 켠다. OpenVPN 이 죽으면 컨테이너가 끝나고 다시 뜬다.
 - **DNS**: VPN 이 알려 준 DNS 만 쓴다. 없으면 이름 해석을 하지 않는다(터널 밖으로 이름이 새지 않게).
-- **ovpn 검사**: ovpn 에 명령을 실행하게 하는 지시(`route-up`, `plugin` 등)가 있으면 시작하지 않는다.
+- **ovpn 검사**: 허용 목록에 있는 지시만 받는다. 그 밖의 지시(`route-up`, `plugin` 등)가 있으면 시작하지 않는다.
+- **스크립트 실행 안 함**: OpenVPN 을 `--script-security 1` 로 띄운다. 검사와 별개로 한 겹 더 막는다.
 - **포트**: Mac 의 `127.0.0.1` 에만 연다. 같은 네트워크의 다른 기기는 붙을 수 없다. SOCKS5 에 비밀번호는 없다.
 
 ## 준비물
@@ -176,7 +177,7 @@ docker exec vpn-proxy-a ip route                      # VPN 이 내려 준 경�
 | 로그에 `ovpn 파일이 없습니다` | `ovpn/vpn-a/` 에 `.ovpn` 이 없다. 넣으면 10초쯤 뒤 저절로 다시 시도한다 |
 | `.ovpn 파일이 2 개입니다` | 폴더에 1개만 남긴다 |
 | `아이디·비밀번호가 필요합니다` | 같은 폴더에 `auth.txt` 를 만든다 |
-| `ovpn 에 받지 않는 지시가 있습니다` | 로그에 찍힌 줄 번호의 지시를 ovpn 에서 지운다. 아래 "ovpn 검사" 참고 |
+| `ovpn 에 받지 않는 내용이 있습니다` | 로그에 찍힌 줄 번호의 지시·글자를 ovpn 에서 지운다(한글 주석 포함). 아래 "ovpn 검사" 참고 |
 | `/etc/resolv.conf 를 쓸 수 없습니다` | 컨테이너를 읽기 전용(`read_only`)으로 띄우지 않는다 |
 | `OpenVPN 이 연결 전에 끝났습니다` | 바로 위의 OpenVPN 로그를 본다. 인증서 경로, 만료, 비밀번호 오류가 흔하다 |
 | `60초 안에 VPN 이 연결되지 않았습니다` | 서버 주소·포트, 회사 방화벽을 확인한다. 느린 VPN 은 `VPN_CONNECT_TIMEOUT` 을 늘린다 |
@@ -200,43 +201,94 @@ docker exec vpn-proxy-a ip -4 addr show tun0 # 터널 주소
 
 ## ovpn 검사
 
-시작할 때 ovpn 을 읽어, 아래 지시가 한 줄이라도 있으면 줄 번호를 알리고 멈춘다.
-ovpn 을 만든 쪽이 컨테이너 안에서 명령을 실행하거나 방화벽을 끄지 못하게 하기 위함이다.
+시작할 때 ovpn 을 읽어 **허용 목록에 있는 지시만** 받는다. 목록에 없는 것이 한 줄이라도 있으면
+줄 번호를 알리고 멈춘다. ovpn 을 만든 쪽이 컨테이너 안에서 명령을 실행하거나, 라이브러리를 불러오거나,
+파일을 쓰거나, 방화벽을 끄지 못하게 하기 위함이다. 검사는 `rootfs/check-ovpn.sh` 가 한다.
 
-| 받지 않는 지시 | 이유 |
+**1. 글자** — 인쇄 가능한 ASCII, 탭, 줄 끝의 CR(윈도우 줄 끝)만 받는다.
+세로 탭, 폼 피드, 줄 중간의 CR, BOM, NUL, **한글 주석**이 있으면 멈춘다. 255자를 넘는 줄도 멈춘다.
+OpenVPN 은 이런 글자를 공백처럼 건너뛰기도 해서, 검사와 OpenVPN 이 같은 줄을 다르게 읽는 틈이 생기기 때문이다.
+
+**2. 지시** — 줄의 첫 단어가 소문자·숫자·`-` 로만 되어 있고 아래 목록에 있어야 한다.
+
+| 종류 | 받는 지시 |
 |---|---|
-| `up` `down` `route-up` `route-pre-down` `ipchange` `tls-verify` `tls-export-cert` `auth-user-pass-verify` `client-connect` `client-disconnect` `client-crresponse` `learn-address` | 명령·스크립트 실행 |
-| `plugin` `pkcs11-providers` `pkcs11-id-management` `iproute` | 외부 프로그램·라이브러리 불러오기 |
-| `script-security` `config` `management` `management-*` | 실행 수준 변경, 다른 설정 불러오기, 원격 제어 |
-| `log` `log-append` `status` `writepid` `daemon` `chroot` `cd` `tmp-dir` | 컨테이너 안에 파일 쓰기·위치 바꾸기 |
-| `setenv`(일부) | `opt`, `CLIENT_CERT`, `FRIENDLY_NAME`, `GENERIC_CONFIG`, `FORWARD_COMPATIBLE`, `PUSH_PEER_INFO` 만 받는다 |
+| 접속 | `client` `pull` `tls-client` `dev` `dev-type` `proto` `remote` `remote-random` `remote-random-hostname` `resolv-retry` `nobind` `port` `lport` `rport` `float` |
+| 유지·재접속 | `persist-key` `persist-tun` `persist-local-ip` `persist-remote-ip` `connect-retry` `connect-retry-max` `connect-timeout` `server-poll-timeout` `explicit-exit-notify` `keepalive` `ping` `ping-restart` `ping-exit` `ping-timer-rem` `inactive` `reneg-sec` `reneg-bytes` `reneg-pkts` `hand-window` `tran-window` `tls-timeout` `tls-exit` `single-session` |
+| 암호·인증 | `cipher` `data-ciphers` `data-ciphers-fallback` `ncp-ciphers` `ncp-disable` `auth` `auth-nocache` `auth-retry` `auth-user-pass` `tls-version-min` `tls-version-max` `tls-cipher` `tls-ciphersuites` `tls-groups` `tls-cert-profile` `tls-auth` `tls-crypt` `tls-crypt-v2` `key-direction` `remote-cert-tls` `remote-cert-ku` `remote-cert-eku` `verify-x509-name` `ns-cert-type` `peer-fingerprint` `ca` `cert` `key` `extra-certs` `pkcs12` `dh` `crl-verify` |
+| 압축·크기 | `comp-lzo` `compress` `allow-compression` `comp-noadapt` `mssfix` `fragment` `tun-mtu` `tun-mtu-extra` `link-mtu` `mtu-disc` `mtu-test` `sndbuf` `rcvbuf` `txqueuelen` `fast-io` |
+| 경로·주소 | `route` `route-metric` `route-delay` `route-nopull` `route-gateway` `redirect-gateway` `redirect-private` `allow-pull-fqdn` `pull-filter` `ifconfig` `ifconfig-nowarn` `topology` `dhcp-option` `block-outside-dns` |
+| 그 밖 | `verb` `mute` `mute-replay-warnings` `replay-window` `disable-occ` `ignore-unknown-option` `push-peer-info` `user` `group` |
+| `setenv` | `setenv CLIENT_CERT·FRIENDLY_NAME·GENERIC_CONFIG·FORWARD_COMPATIBLE·PUSH_PEER_INFO …` 과 `setenv opt <위 목록의 지시>` 만. `setenv opt` 뒤의 지시도 같은 기준으로 검사한다 |
 
-- 대소문자, 앞 공백, 앞의 `--`, `<connection>` 블록 안, `<route-up>` 같은 블록 표기를 모두 본다.
-  지시 이름에 따옴표·역슬래시가 있으면 받지 않는다.
-- 인증서 블록(`<ca>`, `<cert>`, `<key>`, `<tls-auth>`, `<tls-crypt>` 등)의 안쪽은 지시로 보지 않는다.
-- 회사에서 받은 ovpn 에 `log`, `status`, `up /etc/openvpn/update-resolv-conf` 같은 줄이 있으면 그 줄을 지운다.
-  로그는 `docker compose logs` 로 보고, DNS 는 이 구성이 대신 설정한다.
-- OpenVPN 의 스크립트 실행 수준은 명령행에서만 정한다. 이 이미지의 `vpn-up.sh`·`vpn-down.sh` 두 개를
-  부르기 위해 2 로 두며, ovpn 에서는 바꿀 수 없다.
+목록에 없으면 받지 않는다. 예: `up` `down` `route-up` `route-pre-down` `ipchange` `tls-verify`
+`auth-user-pass-verify` `client-connect` `learn-address` `tls-crypt-v2-verify`(명령 실행),
+`plugin` `providers` `engine` `pkcs11-providers`(라이브러리), `script-security` `config` `management`
+`setenv PATH`(실행 환경), `log` `status` `writepid`(파일 쓰기), `http-proxy` `socks-proxy`(이 구성에서 쓰지 않음).
+`dhcp-option DNS 127.x` 처럼 DNS 를 컨테이너 자신으로 돌리는 값도 받지 않는다.
+
+**3. 블록** — `<ca>` `<cert>` `<key>` `<extra-certs>` `<dh>` `<pkcs12>` `<secret>` `<tls-auth>` `<tls-crypt>`
+`<tls-crypt-v2>` `<crl-verify>` `<auth-user-pass>` `<peer-fingerprint>` 와 `<connection>` 만 받는다.
+인증서 블록의 안쪽은 지시로 보지 않는다. `<connection>` 안쪽은 지시로 검사한다.
+닫는 표시는 OpenVPN 과 같은 기준으로 본다: 앞 공백을 뺀 줄이 `</이름>` 으로 시작하면 닫는 것이고,
+그 줄에 다른 글자가 더 있으면(`</ca>x`) 멈춘다.
+
+**회사에서 받은 ovpn 이 거부되면** 로그에 찍힌 줄을 지운다. 흔한 경우:
+
+- `up /etc/openvpn/update-resolv-conf`, `down …`, `script-security 2` → 지운다. DNS 는 이 구성이 대신 설정한다.
+- `log`, `status`, `writepid` → 지운다. 로그는 `docker compose logs` 로 본다.
+- 한글 주석 → 지우거나 영어로 바꾼다.
+- 꼭 필요한 지시가 목록에 없으면 `rootfs/check-ovpn.sh` 의 목록에 더하고 다시 빌드한다(더하기 전에 그 지시가
+  명령 실행·파일 쓰기를 하지 않는지 OpenVPN 문서로 확인한다).
+
+**검사가 뚫려도 스크립트는 실행되지 않는다.** OpenVPN 을 `--script-security 1` 로 띄운다. 이 값에서는
+OpenVPN 이 스크립트를 부르지 못한다(`ip` 같은 내장 동작만). 터널 상태와 DNS 는 훅 스크립트 없이
+entrypoint 가 OpenVPN 의 로그와 터널 장치를 보고 처리한다. 단, `plugin`·`providers` 처럼 라이브러리를
+불러오는 지시는 이 값과 관계없으므로 검사가 막는다.
+
+## 상태 읽기
+
+컨테이너마다 `/run/vpn` 에 상태를 남긴다(root 만 쓴다). 화면이나 스크립트에서 읽기 쉽게 두 가지로 둔다.
+
+```sh
+docker exec vpn-proxy-a cat /run/vpn/state          # 한 단어
+docker exec vpn-proxy-a cat /run/vpn/status.json    # 한 줄 JSON
+```
+
+| `state` | 뜻 | SOCKS5 |
+|---|---|---|
+| `starting` | 설정·ovpn 검사, 방화벽 적용 중 | 꺼짐 |
+| `connecting` | VPN 서버에 접속 중 | 꺼짐 |
+| `up` | 터널 연결됨 | 켜짐 |
+| `reconnecting` | 터널이 내려가 다시 접속 중 | 꺼짐 |
+| `stopped` | 오류나 종료 요청으로 끝나는 중(`message` 에 이유) | 꺼짐 |
+
+```json
+{"name":"vpn-a","state":"up","since":"2026-11-25T06:55:12Z","gen":1,"dns":["10.0.0.2"],"socks_port":1080,"message":"터널 연결됨"}
+```
+
+`gen` 은 터널이 올라온 횟수다. 컨테이너가 떠 있지 않으면 이 파일도 없으므로 `docker compose ps` 를 함께 본다.
+`docker compose ps` 의 healthy 는 `state` 가 `up` 이고 SOCKS 포트가 열려 있다는 뜻이다.
 
 ## 점검 스크립트
 
-실제 VPN 없이 확인할 수 있는 것을 확인한다(설정, 오류 안내, ovpn 검사, 방화벽, 127.0.0.1 바인드, 권한, 재연결, kill-switch).
+실제 VPN 없이 확인할 수 있는 것을 확인한다(설정, 오류 안내, ovpn 검사와 우회 시도, 스크립트 미실행, 방화벽, 127.0.0.1 바인드, 권한, 재연결, kill-switch).
+터널 시험은 같은 이미지로 상대 컨테이너를 하나 띄워 암호 없는 1:1 터널을 맺는 방식이다(비밀값 없음, 이 Mac 안에서만 돈다).
 
 ```sh
 docker compose build && sh tests/smoke.sh
 ```
 
-`vpn-proxy-test-*` 이름의 컨테이너만 만들고 끝나면 지운다. 실제 VPN 서버 접속은 이 스크립트로 확인되지 않는다.
+`vpn-proxy-test-*` 이름의 컨테이너와 네트워크만 만들고 끝나면 지운다. 실제 VPN 서버 접속은 이 스크립트로 확인되지 않는다.
 
 ## 파일
 
 ```
 docker-compose.yml     VPN 3개 서비스(늘리기 쉽게 공통 블록 사용)
 Dockerfile             alpine + openvpn + dante(SOCKS5) + iptables
-rootfs/entrypoint.sh   설정 확인 → 방화벽 → OpenVPN → 터널 확인 → SOCKS5, 감시
-rootfs/vpn-up.sh       터널이 올라올 때: VPN DNS 적용
-rootfs/vpn-down.sh     터널이 내려갈 때: SOCKS5 끄기
+rootfs/entrypoint.sh   설정 확인 → ovpn 검사 → 방화벽 → OpenVPN → 터널 확인 → SOCKS5, 감시
+rootfs/check-ovpn.sh   ovpn 검사(허용 목록)
+rootfs/vpn-lib.sh      상태 기록, DNS 적용, OpenVPN 로그 따라가기
 rootfs/healthcheck.sh  터널 + SOCKS 포트 확인
 .env.example           포트·폴더·이름
 ovpn/vpn-{a,b,c}/      ovpn 을 넣는 곳(내용은 git 제외)

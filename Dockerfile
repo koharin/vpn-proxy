@@ -5,9 +5,9 @@ FROM alpine:3.22.8@sha256:49340b346798875b5592e5d420241f2f9cfba5f47e62ebb1446a1b
 
 RUN apk add --no-cache openvpn dante-server iptables bind-tools tini
 
-COPY rootfs/entrypoint.sh rootfs/vpn-up.sh rootfs/vpn-down.sh rootfs/healthcheck.sh /usr/local/bin/
-RUN chmod 0755 /usr/local/bin/entrypoint.sh /usr/local/bin/vpn-up.sh \
-      /usr/local/bin/vpn-down.sh /usr/local/bin/healthcheck.sh
+COPY rootfs/entrypoint.sh rootfs/check-ovpn.sh rootfs/healthcheck.sh /usr/local/bin/
+COPY rootfs/vpn-lib.sh /usr/local/lib/vpn-lib.sh
+RUN chmod 0755 /usr/local/bin/entrypoint.sh /usr/local/bin/check-ovpn.sh /usr/local/bin/healthcheck.sh
 
 # 터널이 올라와 있고 SOCKS 포트가 열려 있을 때만 healthy.
 HEALTHCHECK --interval=15s --timeout=5s --start-period=90s --retries=2 \

@@ -2,6 +2,13 @@
 # 순서: 설정 확인 → ovpn 검사 → VPN 서버 주소 고정 → 방화벽(kill-switch) → OpenVPN → 터널 확인 → SOCKS5.
 # 터널이 내려가면 SOCKS5 를 끄고, 다시 올라오면 켠다. OpenVPN 이 죽으면 컨테이너가 끝난다
 # (compose 의 restart 가 다시 띄운다).
+#
+# OpenVPN 은 --script-security 1 로 띄운다(스크립트를 부르지 못한다). 터널 상태와 DNS 는
+# 훅 스크립트 없이 여기서 OpenVPN 의 로그와 터널 장치(tun0)를 보고 처리한다.
+#
+# 상태는 /run/vpn 에 남긴다(root 만 쓴다). 밖에서는 docker exec … cat 으로 읽는다.
+#   state        한 단어: starting → connecting → up ⇄ reconnecting. 끝날 때 stopped
+#   status.json  { name, state, since, gen, dns, socks_port, message }
 set -eu
 
 NAME="${VPN_NAME:-vpn}"
@@ -11,16 +18,20 @@ CONNECT_TIMEOUT="${VPN_CONNECT_TIMEOUT:-60}"
 STATE_DIR=/run/vpn
 STATE="$STATE_DIR/state"   # 내용이 'up' 이면 터널이 올라와 있다
 
-log() { echo "[$NAME] $*"; }
+RESOLV_CONF=/etc/resolv.conf
+. /usr/local/lib/vpn-lib.sh
+
+echo "$NAME" | grep -Eq '^[A-Za-z0-9._-]{1,32}$' || { echo "[vpn] 오류: VPN_NAME 은 영문·숫자·._- 32자 이하여야 합니다." >&2; sleep "${VPN_FAIL_SLEEP:-10}"; exit 1; }
+
 die() {
   echo "[$NAME] 오류: $*" >&2
+  set_state stopped "$*" 2>/dev/null || true
   # 바로 끝나면 restart 정책이 1초마다 다시 띄운다. 잠깐 쉬어 로그가 넘치지 않게 한다.
   sleep "${VPN_FAIL_SLEEP:-10}"
   exit 1
 }
 
 is_number() { case "$1" in ''|*[!0-9]*) return 1 ;; *) return 0 ;; esac; }
-is_ipv4() { echo "$1" | grep -Eq '^([0-9]{1,3}\.){3}[0-9]{1,3}$'; }
 tunnel_up() { [ "$(cat "$STATE" 2>/dev/null)" = "up" ] && ip link show tun0 >/dev/null 2>&1; }
 
 is_number "$SOCKS_PORT" || die "SOCKS_PORT 가 숫자가 아닙니다: $SOCKS_PORT"
@@ -40,72 +51,28 @@ else
 fi
 [ -s "$SRC_CONFIG" ] || die "ovpn 파일이 비어 있습니다: $SRC_CONFIG"
 
-# 상태 폴더는 root 만 쓴다. 터널 표시(state)와 세대(gen) 두 파일만 누구나 쓸 수 있게 둔다 —
-# ovpn 에 'user nobody' 가 있으면 재연결 때 훅 스크립트가 nobody 로 돌기 때문이다.
+# 상태 폴더와 그 안의 파일은 root 만 쓴다.
 mkdir -p "$STATE_DIR"
 chmod 0755 "$STATE_DIR"
-echo down > "$STATE"
 echo 0 > "$STATE_DIR/gen"
-chmod 0666 "$STATE" "$STATE_DIR/gen"
+set_state starting "설정 확인 중"
 
 # 검사한 내용 그대로 실행하도록 사본을 만들어 그 사본으로 검사하고 실행한다.
 CONFIG="$STATE_DIR/client.ovpn"
 cp "$SRC_CONFIG" "$CONFIG"
 chmod 0600 "$CONFIG"
 
-# ── 2. ovpn 검사: 명령을 실행하게 하는 지시는 받지 않는다 ──────────────────
-# ovpn 을 만든 쪽이 컨테이너 안에서 명령을 실행하거나 방화벽을 끄지 못하게 한다.
-# 줄마다 첫 단어(지시 이름)만 본다. 인증서 같은 인라인 블록(<ca> … </ca>)의 안쪽은 건너뛴다.
-if ! found=$(awk '
-  BEGIN {
-    n = split("up down route-up route-pre-down ipchange tls-verify tls-export-cert auth-user-pass-verify " \
-              "client-connect client-disconnect client-crresponse learn-address plugin script-security " \
-              "iproute config management pkcs11-providers pkcs11-id-management " \
-              "log log-append status writepid daemon chroot cd tmp-dir", a, " ")
-    for (i = 1; i <= n; i++) bad[a[i]] = 1
-    n = split("ca cert key extra-certs dh pkcs12 secret tls-auth tls-crypt tls-crypt-v2 crl-verify " \
-              "auth-user-pass http-proxy-user-pass peer-fingerprint verify-hash", b, " ")
-    for (i = 1; i <= n; i++) inline_ok[b[i]] = 1
-    n = split("opt CLIENT_CERT FRIENDLY_NAME GENERIC_CONFIG FORWARD_COMPATIBLE PUSH_PEER_INFO", c, " ")
-    for (i = 1; i <= n; i++) env_ok[c[i]] = 1
-    skip = ""; rc = 0
-  }
-  function report(why) { printf "  %d번째 줄: %s\n", NR, why; rc = 1 }
-  {
-    sub(/\r$/, "")
-    line = $0
-    sub(/^[ \t]+/, "", line)
-    if (skip != "") {                       # 인라인 블록 안: 닫는 표시만 찾는다
-      if (tolower(line) ~ ("^</" skip ">[ \t]*$")) skip = ""
-      next
-    }
-    if (line == "" || line ~ /^[#;]/) next
-    word = line
-    sub(/[ \t].*$/, "", word)
-    if (word ~ /["\047\\]/) { report("지시 이름에 따옴표나 역슬래시가 있습니다"); next }
-    low = tolower(word)
-    if (low ~ /^<\/connection>$/ || low ~ /^<connection>$/) next
-    if (low ~ /^<.*>$/) {
-      tag = low; sub(/^</, "", tag); sub(/>$/, "", tag)
-      if (!(tag in inline_ok)) { report("받지 않는 블록 <" tag ">"); next }
-      skip = tag
-      next
-    }
-    sub(/^--/, "", low)
-    if (low in bad || low ~ /^management-/) { report("받지 않는 지시 \"" low "\""); next }
-    if (low == "setenv") {
-      split(line, f, /[ \t]+/)
-      if (!(f[2] in env_ok)) report("받지 않는 지시 \"setenv " f[2] "\"")
-    }
-  }
-  END {
-    if (skip != "") { printf "  블록 <%s> 가 닫히지 않았습니다\n", skip; rc = 1 }
-    exit rc
-  }' "$CONFIG"); then
-  echo "[$NAME] ovpn 에 받지 않는 지시가 있습니다:" >&2
+# ── 2. ovpn 검사: 허용 목록에 있는 지시만 받는다(check-ovpn.sh) ─────────────
+if ! found=$(/usr/local/bin/check-ovpn.sh "$CONFIG" 2>&1); then
+  echo "[$NAME] ovpn 에 받지 않는 내용이 있습니다:" >&2
   echo "$found" >&2
-  die "이 ovpn 으로는 시작하지 않습니다. 명령을 실행하거나 파일을 쓰게 하는 지시는 받지 않습니다. 위 줄을 지우거나, 출처를 믿을 수 없으면 이 ovpn 을 쓰지 마세요."
+  die "이 ovpn 으로는 시작하지 않습니다. 허용 목록에 있는 지시만 받습니다(README 의 'ovpn 검사'). 위 줄을 지우거나, 출처를 믿을 수 없으면 이 ovpn 을 쓰지 마세요."
 fi
+
+# 윈도우 줄 끝(CRLF)을 LF 로 맞춘다. 검사를 통과했으므로 CR 은 줄 끝에만 있다.
+# 이렇게 해야 아래에서 remote·port 값을 읽을 때 CR 이 값에 붙지 않는다.
+tr -d '\r' < "$CONFIG" > "$CONFIG.lf" && mv "$CONFIG.lf" "$CONFIG"
+chmod 0600 "$CONFIG"
 
 AUTH=""
 if [ -n "${VPN_AUTH_FILE:-}" ]; then
@@ -140,12 +107,14 @@ awk -v dp="$DEF_PORT" -v dpr="$DEF_PROTO" '
   }' "$CONFIG" > "$REMOTES"
 [ -s "$REMOTES" ] || die "ovpn 에 remote 줄이 없습니다."
 
-# OpenVPN 은 훅 스크립트에 컨테이너 환경변수를 넘기지 않는다. 필요한 값은 파일로 넘긴다.
-if [ -n "${VPN_DNS:-}" ]; then
-  echo "$VPN_DNS" | grep -Eq '^[0-9A-Fa-f:., ]+$' || die "VPN_DNS 형식이 이상합니다(IP 주소, 쉼표로 여러 개)."
-fi
-printf '%s\n' "${VPN_DNS:-}" > "$STATE_DIR/dns"
-printf '%s\n' "$NAME" > "$STATE_DIR/name"
+FIXED_DNS=""
+for s in $(echo "${VPN_DNS:-}" | tr ',' ' '); do
+  ok_dns "$s" || die "VPN_DNS 에 쓸 수 없는 주소가 있습니다: $s (IPv4 주소만, 127.x 는 안 됩니다)"
+  FIXED_DNS="$FIXED_DNS $s"
+done
+# ovpn 파일에 직접 적힌 DNS(dhcp-option DNS …). 서버가 내려 주는 것은 접속 뒤 로그에서 읽는다.
+FILE_DNS=$(awk '$1=="dhcp-option" && $2=="DNS" {print $3}' "$CONFIG")
+FILE_DOMAINS=$(awk '$1=="dhcp-option" && ($2=="DOMAIN" || $2=="DOMAIN-SEARCH") {print $3}' "$CONFIG")
 
 # 이름으로 적힌 서버는 지금(방화벽 전) 주소를 찾아 /etc/hosts 에 고정한다.
 # 재연결 때 DNS 없이도 같은 주소로 붙는다.
@@ -173,9 +142,9 @@ done < "$REMOTES"
 [ -s "$ALLOW" ] || die "VPN 서버 주소를 하나도 찾지 못했습니다(DNS 또는 네트워크 확인)."
 
 # 서버 주소를 고정했으니 터널 밖 DNS(Docker DNS)는 더 쓰지 않는다. 지금 비워 두고,
-# 터널이 올라오면 vpn-up.sh 가 VPN 의 DNS 를 적는다. 비우지 못하면 이름이 터널 밖으로
+# 터널이 올라오면 apply_dns 가 VPN 의 DNS 를 적는다. 비우지 못하면 이름이 터널 밖으로
 # 샐 수 있으므로 시작하지 않는다.
-if ! echo "# 터널이 올라오기 전: 이름 해석을 하지 않는다" > /etc/resolv.conf 2>/dev/null; then
+if ! echo "# 터널이 올라오기 전: 이름 해석을 하지 않는다" > "$RESOLV_CONF" 2>/dev/null; then
   die "/etc/resolv.conf 를 쓸 수 없습니다. 이름 해석이 터널 밖으로 샐 수 있어 시작하지 않습니다(루트 파일 시스템을 읽기 전용으로 띄우지 마세요)."
 fi
 
@@ -226,22 +195,33 @@ stop_all() {
   kill_socks
   [ -n "$OVPN_PID" ] && kill "$OVPN_PID" 2>/dev/null || true
 }
-trap 'stop_all; exit 0' TERM INT
+trap 'stop_all; set_state stopped "종료 요청"; exit 0' TERM INT
 
-# script-security 는 여기(명령행)에서만 정한다. 2 는 이 이미지의 vpn-up.sh·vpn-down.sh 를 부르기 위한 값이다.
-# ovpn 안의 스크립트 지시는 2번 단계에서 이미 걸러졌고, 명령행의 값이 ovpn 뒤에 와서 이긴다.
+# script-security 1: OpenVPN 이 스크립트를 부르지 못한다(ip·route 같은 내장 동작만). 명령행의 값이
+# ovpn 뒤에 와서 이기고, ovpn 안의 script-security·스크립트 지시는 2번 단계에서 이미 걸러졌다.
+# verb 는 3 이상이어야 위의 로그 줄이 나온다.
+VERB="${VPN_VERB:-3}"
+is_number "$VERB" && [ "$VERB" -ge 3 ] || VERB=3
 set -- --config "$CONFIG" --cd "$VPN_DIR" --dev tun0 --dev-type tun \
-  --script-security 2 --up /usr/local/bin/vpn-up.sh --down /usr/local/bin/vpn-down.sh --up-restart \
-  --auth-nocache --verb "${VPN_VERB:-3}"
+  --script-security 1 --auth-nocache --verb "$VERB"
 [ -n "$AUTH" ] && set -- "$@" --auth-user-pass "$AUTH"
 
+FIFO="$STATE_DIR/log.fifo"
+rm -f "$FIFO"
+mkfifo -m 0600 "$FIFO"
+watch_log < "$FIFO" &
+WATCH_PID=$!
+
+set_state connecting "VPN 서버에 접속 중"
 log "OpenVPN 시작: $(basename "$SRC_CONFIG")"
-openvpn "$@" &
+openvpn "$@" > "$FIFO" 2>&1 &
 OVPN_PID=$!
+echo "$OVPN_PID" > "$STATE_DIR/openvpn.pid"
 
 waited=0
 while ! tunnel_up; do
   if ! kill -0 "$OVPN_PID" 2>/dev/null; then
+    sleep 0.5 # 남은 로그가 다 찍히게 잠깐 기다린다
     die "OpenVPN 이 연결 전에 끝났습니다. 위 로그를 확인하세요(인증서, 아이디·비밀번호, 서버 주소)."
   fi
   if [ "$waited" -ge "$CONNECT_TIMEOUT" ]; then
@@ -295,10 +275,11 @@ stop_socks() {
   log "SOCKS5 중단: 터널이 내려갔습니다"
 }
 
+# 로그를 읽는 쪽이 죽으면 OpenVPN 이 로그를 못 써 멈춘다. 그런 일이 없게 같이 지켜본다.
 # gen 은 터널이 올라올 때마다 1 씩 는다. 값이 바뀌었으면 그 사이에 터널이 한 번 내려갔던 것이므로
 # (2초 간격 사이에 지나갔더라도) SOCKS5 를 새 터널 기준으로 다시 띄운다.
 SOCKS_GEN=""
-while kill -0 "$OVPN_PID" 2>/dev/null; do
+while kill -0 "$OVPN_PID" 2>/dev/null && kill -0 "$WATCH_PID" 2>/dev/null; do
   if tunnel_up; then
     gen=$(cat "$STATE_DIR/gen" 2>/dev/null || echo 0)
     if [ -n "$SOCKS_PID" ] && [ "$gen" != "$SOCKS_GEN" ]; then
