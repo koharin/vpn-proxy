@@ -74,6 +74,34 @@ fi
 tr -d '\r' < "$CONFIG" > "$CONFIG.lf" && mv "$CONFIG.lf" "$CONFIG"
 chmod 0600 "$CONFIG"
 
+# user·group 줄은 OpenVPN 에 넘기는 사본에서 뺀다(원본 파일은 그대로다).
+# 이 컨테이너의 root 에는 다른 사용자 프로세스에 신호를 보낼 권한(CAP_KILL)이 없다. OpenVPN 이
+# nobody 로 내려가면 여기서 살아 있는지 확인도, 끝내지도 못한다. 컨테이너 안이라 내려서 얻는 것도 작다.
+# "setenv opt user …" 처럼 감싼 것도 같이 뺀다. 인증서 블록 안쪽은 건드리지 않는다.
+# 줄 번호가 달라지지 않게 그 자리에 주석 줄을 남긴다.
+awk -v name="$NAME" '
+  function ltrim(s) { sub(/^[ \t]+/, "", s); return s }
+  {
+    line = ltrim($0)
+    if (skip != "") {
+      if (substr(line, 1, length(skip) + 3) == "</" skip ">") skip = ""
+      print; next
+    }
+    if (line ~ /^<[a-z0-9-]+>[ \t]*$/) {
+      tag = line; sub(/[ \t]+$/, "", tag); tag = substr(tag, 2, length(tag) - 2)
+      if (tag != "connection") skip = tag
+      print; next
+    }
+    while (line ~ /^setenv[ \t]+opt[ \t]+/) sub(/^setenv[ \t]+opt[ \t]+/, "", line)
+    word = line; sub(/[ \t].*$/, "", word)
+    if (word == "user" || word == "group") {
+      printf "[%s] 줄 %d: user/group 은 컨테이너 안에서 쓰지 않아 뺐습니다\n", name, NR > "/dev/stderr"
+      print "# (removed: user/group)"; next
+    }
+    print
+  }' "$CONFIG" > "$CONFIG.ug" && mv "$CONFIG.ug" "$CONFIG"
+chmod 0600 "$CONFIG"
+
 AUTH=""
 if [ -n "${VPN_AUTH_FILE:-}" ]; then
   AUTH="$VPN_DIR/$VPN_AUTH_FILE"

@@ -244,6 +244,10 @@ OpenVPN 은 이런 글자를 공백처럼 건너뛰기도 해서, 검사와 Open
 - `up /etc/openvpn/update-resolv-conf`, `down …`, `script-security 2` → 지운다. DNS 는 이 구성이 대신 설정한다.
 - `log`, `status`, `writepid` → 지운다. 로그는 `docker compose logs` 로 본다.
 - 한글 주석 → 지우거나 영어로 바꾼다.
+- `user nobody`, `group nogroup` → 그대로 둬도 된다. OpenVPN 에 넘기는 사본에서 자동으로 빼고 로그에
+  `줄 N: user/group 은 컨테이너 안에서 쓰지 않아 뺐습니다` 를 찍는다(원본 파일은 바꾸지 않는다). 이 컨테이너의
+  root 에는 다른 사용자 프로세스에 신호를 보낼 권한(CAP_KILL)이 없어, OpenVPN 이 `nobody` 로 내려가면
+  살아 있는지 확인도 종료도 할 수 없기 때문이다.
 - `ca /etc/openvpn/ca.crt` 같은 절대 경로 → 그 파일을 ovpn 과 같은 폴더에 두고 `ca ca.crt` 로 바꾼다.
 - 꼭 필요한 지시가 목록에 없으면 `rootfs/check-ovpn.sh` 의 목록에 더하고 다시 빌드한다(더하기 전에 그 지시가
   명령 실행·파일 쓰기를 하지 않는지 OpenVPN 문서로 확인한다).

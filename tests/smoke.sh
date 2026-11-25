@@ -166,6 +166,17 @@ printf 'client\r\ndev tun\r\nproto udp\r\nremote 192.0.2.1 1194\r\nresolv-retry 
 run_once okcfg "$TMP/okcfg"
 if echo "$out" | grep -q "OpenVPN 시작" && ! echo "$out" | grep -q "받지 않는"; then ok "정상 ovpn(CRLF·주석·인증서 블록·흔한 지시)은 검사를 통과"; else bad "정상 ovpn 이 막힘: $out"; fi
 
+# 3-g) user·group 빼기는 인증서 블록 안쪽을 건드리지 않는다(블록 안 5번째 줄은 그대로, 7·8번째 줄만 뺀다).
+printf 'client\ndev tun\nremote 192.0.2.1 1194 udp\n<ca>\nuser nobody\n</ca>\ngroup nogroup\n\t setenv opt  setenv opt\tuser x\nusername-as-common-name-not-a-directive\n' > "$TMP/dead/client.ovpn"
+run_once ug "$TMP/dead"
+if echo "$out" | grep -q '받지 않는 지시 "username-as-common-name-not-a-directive"'; then
+  printf 'client\ndev tun\nremote 192.0.2.1 1194 udp\n<ca>\nuser nobody\n</ca>\ngroup nogroup\n\t setenv opt  setenv opt\tuser x\n' > "$TMP/dead/client.ovpn"
+  run_once ug "$TMP/dead"
+  if [ "$(echo "$out" | grep -c 'user/group 은')" = "2" ] && echo "$out" | grep -q '줄 7: user/group' && echo "$out" | grep -q '줄 8: user/group' && ! echo "$out" | grep -q '줄 5: user/group'; then ok "user·group 빼기: 블록 안쪽은 그대로, 겹친 setenv opt 도 뺌"; else bad "user/group 빼기: $out"; fi
+else
+  bad "user 로 시작하는 다른 낱말이 검사에서 걸리지 않음: $out"
+fi
+
 echo "4) 검사와 별개로 스크립트는 실행되지 않는다 (script-security 1)"
 if grep -q -- '--script-security 1 ' rootfs/entrypoint.sh && ! grep -Eq -- '--(up|down|route-up)[ "]' rootfs/entrypoint.sh; then ok "entrypoint 는 --script-security 1 이고 훅 스크립트를 넘기지 않음"; else bad "entrypoint 의 OpenVPN 옵션이 다름"; fi
 # 검사를 거치지 않고 OpenVPN 에 route-up 이 든 설정을 직접 준다. 1 이면 실행되지 않고, 2 면 실행된다(대조).
@@ -252,12 +263,17 @@ $DOCKER run -d --name vpn-proxy-test-peer --network "$NET" --cap-drop ALL --cap-
   --entrypoint openvpn $IMAGE --dev tun0 --ifconfig 10.99.0.1 10.99.0.2 --proto udp --port 1194 --float --ping 1 --verb 3 >/dev/null
 peer_ip=$($DOCKER inspect -f '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}' vpn-proxy-test-peer)
 $DOCKER exec -d vpn-proxy-test-peer sh -c 'while :; do printf "HTTP/1.0 200 OK\r\nContent-Length: 10\r\n\r\nvia-tunnel" | nc -l -p 8099 -s 10.99.0.1; done'
-printf 'dev tun\nproto udp\nremote %s 1194\nifconfig 10.99.0.2 10.99.0.1\nping 1\nping-restart 4\ndhcp-option DNS 10.99.0.53\n' "$peer_ip" > "$TMP/client/client.ovpn"
+printf 'dev tun\nproto udp\nremote %s 1194\nifconfig 10.99.0.2 10.99.0.1\nping 1\nping-restart 4\ndhcp-option DNS 10.99.0.53\nuser nobody\ngroup nobody\nsetenv opt user nobody\n' "$peer_ip" > "$TMP/client/client.ovpn"
 drun -d --name vpn-proxy-test-client --network "$NET" -p 127.0.0.1::1080 -v "$TMP/client:/vpn:ro" $IMAGE >/dev/null
 
 if wait_state up 25 && sleep 3 && in_c pidof sockd >/dev/null 2>&1; then
   ok "터널이 올라온 뒤 SOCKS5 시작(state=up)"
   if in_c cat /run/vpn/status.json | grep -q '"state":"up".*"dns":\["10.99.0.53"\]'; then ok "status.json 에 state=up 과 DNS"; else bad "status.json: $(in_c cat /run/vpn/status.json)"; fi
+  # ovpn 에 user·group 줄이 있어도(8·9·10번째 줄) 사본에서 빼고 뜬다. 원본은 그대로다.
+  clog=$($DOCKER logs vpn-proxy-test-client 2>&1)
+  if [ "$(echo "$clog" | grep -c 'user/group 은 컨테이너 안에서 쓰지 않아 뺐습니다')" = "3" ] && echo "$clog" | grep -q '줄 8: user/group' && echo "$clog" | grep -q '줄 10: user/group'; then ok "user·group 줄(setenv opt 포함) 3개를 뺐다고 줄 번호와 함께 안내"; else bad "user/group 안내: $(echo "$clog" | grep 'user/group')"; fi
+  if ! in_c grep -Eq '^[[:space:]]*(setenv[[:space:]]+opt[[:space:]]+)*(user|group)([[:space:]]|$)' /run/vpn/client.ovpn && [ "$(in_c grep -c '^user nobody$' /vpn/client.ovpn)" = "1" ] && [ "$(in_c sh -c 'wc -l < /run/vpn/client.ovpn')" = "$(in_c sh -c 'wc -l < /vpn/client.ovpn')" ]; then ok "사본에는 user·group 이 없고 줄 수는 같으며 원본 파일은 그대로"; else bad "사본/원본: $(in_c grep -n 'user\|group' /run/vpn/client.ovpn /vpn/client.ovpn)"; fi
+  if [ "$(in_c sh -c 'stat -c %u /proc/$(cat /run/vpn/openvpn.pid)')" = "0" ] && in_c sh -c 'kill -0 $(cat /run/vpn/openvpn.pid)'; then ok "OpenVPN 은 root 로 남아 entrypoint 가 살아 있는지 확인·종료할 수 있음"; else bad "OpenVPN 사용자: $(in_c sh -c 'stat -c %u /proc/$(cat /run/vpn/openvpn.pid)')"; fi
   cmdline=$(in_c sh -c 'tr "\0" " " < /proc/$(cat /run/vpn/openvpn.pid)/cmdline')
   case "$cmdline" in *"--script-security 1 "*) ok "실행 중인 OpenVPN 은 --script-security 1" ;; *) bad "OpenVPN 옵션: $cmdline" ;; esac
 
