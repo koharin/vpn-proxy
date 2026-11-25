@@ -1,0 +1,35 @@
+# ~/.ssh/config 에 붙여 쓴다. 같은 내부 IP 라도 어느 VPN 으로 갈지는 별칭(-a/-b/-c)이 정한다.
+#   ssh web-a   → vpn-a 안의 10.0.0.10
+#   ssh web-b   → vpn-b 안의 10.0.0.10 (대역이 겹쳐도 다른 서버)
+# nc 는 macOS 기본 nc(-X 5 = SOCKS5, -x = 프록시 주소)를 쓴다.
+
+# ── VPN별 공통 설정: 이름이 *-a 로 끝나는 호스트는 모두 vpn-a 로 ──
+Host *-a
+    ProxyCommand nc -X 5 -x 127.0.0.1:1081 %h %p
+Host *-b
+    ProxyCommand nc -X 5 -x 127.0.0.1:1082 %h %p
+Host *-c
+    ProxyCommand nc -X 5 -x 127.0.0.1:1083 %h %p
+
+# ── 서버 별칭(주소·계정은 예시) ──
+Host web-a
+    HostName 10.0.0.10
+    User ubuntu
+    HostKeyAlias web-a        # IP 가 겹쳐도 known_hosts 가 섞이지 않게
+
+Host web-b
+    HostName 10.0.0.10
+    User ubuntu
+    HostKeyAlias web-b
+
+Host db-c
+    HostName 10.0.1.20
+    User ubuntu
+    HostKeyAlias db-c
+
+# 별칭 없이 한 번만 쓸 때:
+#   ssh -o ProxyCommand='nc -X 5 -x 127.0.0.1:1081 %h %p' ubuntu@10.0.0.10
+#
+# RDP·DB 처럼 SOCKS 를 모르는 프로그램은 ssh 로 로컬 포트를 연다:
+#   ssh -N -L 127.0.0.1:13389:10.0.0.30:3389 web-a    → RDP 클라이언트는 127.0.0.1:13389
+#   ssh -N -L 127.0.0.1:15432:10.0.1.20:5432 web-b    → psql -h 127.0.0.1 -p 15432
