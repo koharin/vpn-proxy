@@ -69,10 +69,12 @@ _B64_LONG = re.compile(r"[A-Za-z0-9+/=]{48,}")
 _CONTROL = re.compile(r"[\x00-\x08\x0b-\x1f\x7f-\x9f]")
 _ANSI = re.compile(r"\x1b\[[0-9;?]*[ -/]*[@-~]")
 HIDDEN = "[가림]"
+LINE_SCAN_MAX = 2000  # 가리기 전에 줄을 이 길이로 자른다(아주 긴 줄에서 검사 시간이 길이의 제곱으로 늘지 않게)
 
 
 def redact_line(line):
     """로그 한 줄을 화면에 내도 되는 모양으로 바꾼다."""
+    line = line[:LINE_SCAN_MAX]
     line = _ANSI.sub("", line)
     line = _CONTROL.sub("", line)
     line = _PEM_BEGIN.sub(HIDDEN, line)
@@ -91,6 +93,7 @@ def redact_log(text, limit=LOG_LINES):
     out = []
     in_pem = False
     for raw in text.splitlines():
+        raw = raw[:LINE_SCAN_MAX]
         if not raw.strip():
             continue
         if in_pem:

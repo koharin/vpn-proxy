@@ -421,6 +421,32 @@ class GuiTest(unittest.TestCase):
             self.server.RequestHandlerClass.timeout = gui.REQUEST_TIMEOUT
         self.assertEqual(self.overview()["ok"], True)  # 그 뒤에도 정상 응답
 
+    def test_long_lines_are_cut_before_redaction(self):
+        import time
+
+        self.assertLessEqual(gui.LINE_SCAN_MAX, 2000)
+        n = 300_000
+        hostile = [
+            "a_" * n,  # 밑줄로 이어진 이름 조각
+            "a-" * n + "password",
+            "x://" + "a" * n,
+            "A" * n + " ",
+            "pass " * n,
+            "-----BEGIN " + "A " * n,
+            "\x1b[" + "1;" * n,
+            ("password=S3cr3tValue " + "b_" * n),
+        ]
+        start = time.monotonic()
+        for line in hostile:
+            out = gui.redact_line(line)
+            self.assertLessEqual(len(out), gui.LOG_LINE_MAX + 1)
+            self.assertNotIn("S3cr3tValue", out)
+        lines = gui.redact_log("\n".join(hostile * 5))
+        self.assertLess(time.monotonic() - start, 2.0)  # 자르지 않으면 수십 초가 걸린다
+        self.assertTrue(all(len(l) <= gui.LOG_LINE_MAX + 1 for l in lines))
+        # 잘린 뒤쪽에 있던 값은 화면에 나가지 않는다
+        self.assertNotIn("TAILSECRET", gui.redact_line("x" * 5000 + " password=TAILSECRET"))
+
     def test_repo_files(self):
         self.assertIn("!rootfs/", (REPO / ".dockerignore").read_text())  # 화면 코드는 이미지에 들어가지 않는다
         src = (REPO / "gui" / "server.py").read_text()
