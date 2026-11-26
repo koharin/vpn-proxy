@@ -78,11 +78,13 @@ OVPN_READ_MAX = 256 * 1024
 TITLE_MAX = 80
 _REMOTE_HOST = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,252}$")
 _REMOTE_PROTO = re.compile(r"^(?:udp|tcp)[46]?(?:-client)?$")
+_PORT = re.compile(r"[0-9]{1,5}")
 _BLOCK_OPEN = re.compile(r"^<([a-z0-9-]+)>$")
 
 
 def _port(word):
-    return word if word.isdigit() and 1 <= int(word) <= 65535 else None
+    # isdigit() 은 '²'·'١' 같은 글자도 숫자로 보므로 쓰지 않는다(int() 가 못 읽거나 그대로 화면에 나간다).
+    return word if _PORT.fullmatch(word) and 1 <= int(word) <= 65535 else None
 
 
 def ovpn_target(path):
@@ -264,7 +266,10 @@ class Manager:
         if names is not None and len(names) == 1:
             stem = _CONTROL.sub("", names[0][: -len(".ovpn")]).strip()[:TITLE_MAX]
             title = stem or title
-            server, more = ovpn_target(os.path.join(profile["folder"], names[0]))
+            try:
+                server, more = ovpn_target(os.path.join(profile["folder"], names[0]))
+            except Exception:  # 깨진 ovpn 하나가 다른 프로필의 표시까지 막지 않게 한다
+                server, more = "", 0
         return {
             "id": profile["id"],
             "name": profile["name"],

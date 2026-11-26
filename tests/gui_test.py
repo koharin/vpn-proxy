@@ -302,6 +302,44 @@ class GuiTest(unittest.TestCase):
         self.assertIn("p.server", js)
         self.assertNotIn("innerHTML", js)
 
+    def test_v1_odd_port_or_unreadable_ovpn_blanks_only_that_profile(self):
+        f = Path(self.tmp) / "t.ovpn"
+        # isdigit() 은 참이지만 [0-9] 가 아닌 글자, 범위 밖 숫자는 포트로 쓰지 않는다
+        cases = {
+            "port \u00b2\nremote h.example.com\n": "h.example.com:1194/udp",
+            "remote h.example.com \u00b2 udp\n": "h.example.com:1194/udp",
+            "remote h.example.com \u0661\u0662\u0663\n": "h.example.com:1194/udp",
+            "remote h.example.com 0\n": "h.example.com:1194/udp",
+            "remote h.example.com 65536\n": "h.example.com:1194/udp",
+            "remote h.example.com 123456\n": "h.example.com:1194/udp",
+            "remote h.example.com 65535\n": "h.example.com:65535/udp",
+        }
+        for body, want in cases.items():
+            f.write_text(body, encoding="utf-8")
+            self.assertEqual(gui.ovpn_target(str(f)), (want, 0), body)
+        d = Path(self.tmp) / "ovpn"
+        (d / "vpn-a" / "client.ovpn").write_text("remote a.example.com \u00b2 udp\nport \u00b2\n", encoding="utf-8")
+        (d / "vpn-b" / "b.ovpn").write_text("remote b.example.com 443 tcp\n")
+        self.save()
+        p = self.by_id(self.overview())
+        self.assertEqual((p["vpn-a"]["server"], p["vpn-b"]["server"]), ("a.example.com:1194/udp", "b.example.com:443/tcp"))
+        # ovpn 읽기가 어떤 이유로든 실패해도 그 프로필의 서버만 비고 나머지는 그대로 보인다
+        real = gui.ovpn_target
+
+        def broken(path):
+            if os.path.basename(path) == "client.ovpn":
+                raise ValueError("broken ovpn")
+            return real(path)
+
+        gui.ovpn_target = broken
+        try:
+            self.save()
+            p = self.by_id(self.overview())
+        finally:
+            gui.ovpn_target = real
+        self.assertEqual((p["vpn-a"]["title"], p["vpn-a"]["server"], p["vpn-a"]["server_more"]), ("client", "", 0))
+        self.assertEqual((p["vpn-b"]["title"], p["vpn-b"]["server"]), ("b", "b.example.com:443/tcp"))
+
     def test_states(self):
         run = {"Running": True, "Restarting": False}
         st = lambda s, m: {"name": "x", "state": s, "since": "2026-11-26T01:00:00Z", "gen": 1, "dns": ["10.0.0.2", "<b>x</b>"], "socks_port": 1080, "message": m}
