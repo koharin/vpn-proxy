@@ -270,6 +270,17 @@ class GuiTest(unittest.TestCase):
         self.assertIn("이 ovpn 으로는 시작하지 않습니다", p["vpn-a"]["message"])
         self.assertEqual(p["vpn-b"]["state"], "off")
         self.assertEqual(p["vpn-c"]["state"], "connecting")
+        # 상태 파일이 아직 없는데(설정 확인에서 멈춤) 로그 마지막 줄이 오류면 실패와 사유를 보여 준다
+        self.state["containers"]["vpn-proxy-c"] = {"State": run, "logs": "[vpn-c] 오류: ovpn 파일이 없습니다. 폴더에 .ovpn 파일 1개를 넣으세요.\n"}
+        self.save()
+        c = self.by_id(self.overview())["vpn-c"]
+        self.assertEqual(c["state"], "failed")
+        self.assertIn("ovpn 파일이 없습니다", c["message"])
+        self.assertIn("자동으로 다시 시도", c["message"])
+        # 오류 뒤에 새 줄이 있으면(다시 시도 중) 연결 중이다
+        self.state["containers"]["vpn-proxy-c"]["logs"] += "[vpn-c] 방화벽 적용: 터널과 VPN 서버 1곳만 허용\n"
+        self.save()
+        self.assertEqual(self.by_id(self.overview())["vpn-c"]["state"], "connecting")
 
     def test_docker_down_is_reported_not_crashed(self):
         self.state["daemon"] = False

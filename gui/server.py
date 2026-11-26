@@ -271,6 +271,11 @@ class Manager:
                 inner = {}
         word = inner.get("state") if isinstance(inner.get("state"), str) else ""
         view["state"] = INNER_TO_VIEW.get(word, CONNECTING)
+        # 설정 확인에서 멈춘 경우(ovpn 없음 등)는 상태 파일을 만들기 전이라 읽을 것이 없다.
+        # 이때 로그의 마지막 줄이 오류면 실패로 본다(컨테이너는 잠깐 쉬었다가 다시 시도한다).
+        if not word and lines and re.search(r"\] 오류: ", lines[-1]):
+            view["state"] = FAILED
+            view["message"] = last_error
         view["message"] = redact_line(str(inner.get("message") or ""))
         since = inner.get("since")
         view["since"] = since if isinstance(since, str) and re.match(r"^[0-9T:Z-]{1,24}$", since) else ""
