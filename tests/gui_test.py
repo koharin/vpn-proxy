@@ -243,6 +243,65 @@ class GuiTest(unittest.TestCase):
         self.assertNotIn("SECRET-IN-AUTH-FILE", text)
         self.assertNotIn(self.tmp, text)
 
+    def test_title_is_ovpn_name_and_subtitle_is_server(self):
+        d = Path(self.tmp) / "ovpn"
+        (d / "vpn-c").mkdir()
+        (d / "vpn-a" / "client.ovpn").rename(d / "vpn-a" / "ENKI 1.ovpn")  # 공백이 든 이름
+        (d / "vpn-a" / "ENKI 1.ovpn").write_text(
+            "client\r\nproto udp4\r\n<ca>\nremote in-ca.example 1 udp\nCA-BODY-SECRET\n</ca>\n"
+            "remote 192.0.2.10 1194\r\n<tls-crypt>\nTLS-CRYPT-SECRET\n</tls-crypt>\n<key>\nKEY-BODY-SECRET\n</key>\n"
+            "auth-user-pass\nverify-x509-name SERVER-CN-NOT-SHOWN name\n"
+        )
+        (d / "vpn-b" / "apex2026_gt_someone.name.ovpn").write_text(
+            "remote vpn.example.net 443 tcp\nremote second.example.net\n<connection>\nremote third.example.net 80\n</connection>\nport 5000\n"
+        )
+        (d / "vpn-c" / "one.ovpn").write_text("remote 192.0.2.1\n")
+        (d / "vpn-c" / "two.ovpn").write_text("remote 192.0.2.2\n")
+        self.save()
+        data = self.overview()
+        p = self.by_id(data)
+        self.assertEqual((p["vpn-a"]["title"], p["vpn-a"]["server"], p["vpn-a"]["server_more"]), ("ENKI 1", "192.0.2.10:1194/udp4", 0))
+        self.assertEqual((p["vpn-b"]["title"], p["vpn-b"]["server"], p["vpn-b"]["server_more"]), ("apex2026_gt_someone.name", "vpn.example.net:443/tcp", 2))
+        # .ovpn 이 2개면 어느 것인지 알 수 없으니 폴더 이름을 제목으로 두고 서버는 비운다
+        self.assertEqual((p["vpn-c"]["title"], p["vpn-c"]["server"], p["vpn-c"]["ovpn_files"]), ("vpn-c", "", 2))
+        # 폴더 이름과 로컬 포트는 그대로 따로 온다(화면에서 작게 보인다)
+        self.assertEqual((p["vpn-a"]["name"], p["vpn-a"]["socks_port"], p["vpn-a"]["folder"]), ("vpn-a", 1081, "ovpn/vpn-a"))
+        # 인증서·키 블록 안쪽과 remote·port·proto 가 아닌 줄은 응답에 없다
+        text = json.dumps(data, ensure_ascii=False)
+        for secret in ("CA-BODY-SECRET", "TLS-CRYPT-SECRET", "KEY-BODY-SECRET", "in-ca.example", "SERVER-CN-NOT-SHOWN", "SECRET-IN-AUTH-FILE"):
+            self.assertNotIn(secret, text)
+        # Docker 가 꺼져 있어도 제목·서버는 보인다
+        self.state["daemon"] = False
+        self.save()
+        p = self.by_id(self.overview())
+        self.assertEqual((p["vpn-a"]["title"], p["vpn-a"]["server"], p["vpn-a"]["state"]), ("ENKI 1", "192.0.2.10:1194/udp4", "unknown"))
+
+    def test_ovpn_target_takes_only_well_formed_values(self):
+        f = Path(self.tmp) / "t.ovpn"
+        cases = {
+            "remote host.example\n": ("host.example:1194/udp", 0),
+            "port 443\nproto tcp-client\nremote host.example\n": ("host.example:443/tcp-client", 0),
+            "remote 2001:db8::1 1194 udp6\n": ("[2001:db8::1]:1194/udp6", 0),
+            "  remote\thost.example  99999 weird\n": ("host.example:1194/udp", 0),  # 이상한 포트·프로토콜은 버린다
+            "remote <script>alert(1)</script> 1194\n# remote c.example\n;remote d.example\n": ("", 0),
+            "remote-cert-tls server\ndev tun\n": ("", 0),
+            "<key>\nremote hidden.example 1\n": ("", 0),  # 닫히지 않은 블록
+            "": ("", 0),
+        }
+        for body, want in cases.items():
+            f.write_text(body)
+            self.assertEqual(gui.ovpn_target(str(f)), want, body)
+        self.assertEqual(gui.ovpn_target(str(Path(self.tmp) / "none.ovpn")), ("", 0))
+        link = Path(self.tmp) / "link.ovpn"
+        f.write_text("remote host.example\n")
+        link.symlink_to(f)
+        self.assertEqual(gui.ovpn_target(str(link)), ("", 0))  # 링크는 따라가지 않는다
+        # 화면은 제목·서버를 글자로만 넣는다
+        js = (REPO / "gui" / "static" / "app.js").read_text()
+        self.assertIn("p.title || p.name", js)
+        self.assertIn("p.server", js)
+        self.assertNotIn("innerHTML", js)
+
     def test_states(self):
         run = {"Running": True, "Restarting": False}
         st = lambda s, m: {"name": "x", "state": s, "since": "2026-11-26T01:00:00Z", "gen": 1, "dns": ["10.0.0.2", "<b>x</b>"], "socks_port": 1080, "message": m}
@@ -463,8 +522,9 @@ class GuiTest(unittest.TestCase):
         src = (REPO / "gui" / "server.py").read_text()
         self.assertNotIn("shell=True", src)
         self.assertNotIn("os.system", src)
-        # ovpn·auth 파일을 여는 코드가 없다(파일 수만 센다)
-        self.assertNotIn("open(", src)
+        # 파일을 여는 곳은 ovpn 에서 서버 주소를 읽는 한 곳뿐이다(auth 파일은 열지 않는다)
+        self.assertEqual(src.count("open("), 1)
+        self.assertNotIn("auth.txt", src.split('"""', 2)[2])
         self.assertEqual(src.count("read_bytes"), 1)  # 정적 파일 한 곳뿐
 
 

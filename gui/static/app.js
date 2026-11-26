@@ -27,15 +27,24 @@ function card(p, dockerOk) {
   const state = STATE_TEXT[p.state] ? p.state : "unknown";
   const box = el("article", "card");
 
+  // 제목 = .ovpn 파일 이름, 부제 = 접속하는 VPN 서버. 폴더 이름과 로컬 포트는 작게 덧붙인다.
+  const title = p.title || p.name;
   const head = el("div", "row");
-  head.append(el("h2", "name", p.name));
-  head.append(el("span", "badge s-" + state, STATE_TEXT[state]));
-  head.append(el("span", "grow"));
+  const names = el("div", "names");
+  const top = el("div", "row");
+  top.append(el("h2", "name", title));
+  top.append(el("span", "badge s-" + state, STATE_TEXT[state]));
+  names.append(top);
+  let server = p.server || "서버 주소를 읽지 못함";
+  if (p.server && p.server_more > 0) server += " 외 " + p.server_more + "곳";
+  names.append(el("p", "server", server));
+  names.append(el("p", "aux", p.name + " · 로컬 포트 " + (p.socks_port || "없음")));
+  head.append(names);
   const running = state === "up" || state === "connecting" || state === "failed";
   const btn = el("button", running ? "off" : "", running ? "끄기" : "켜기");
   btn.type = "button";
   btn.disabled = !dockerOk || busy.has(p.id);
-  btn.setAttribute("aria-label", p.name + (running ? " 끄기" : " 켜기"));
+  btn.setAttribute("aria-label", title + (running ? " 끄기" : " 켜기"));
   btn.addEventListener("click", () => toggle(p, !running));
   head.append(btn);
   box.append(head);
@@ -80,7 +89,7 @@ async function refresh() {
 async function toggle(p, on) {
   if (busy.has(p.id)) return;
   busy.add(p.id);
-  show(notice, p.name + (on ? " 켜는 중…" : " 끄는 중…"));
+  show(notice, (p.title || p.name) + (on ? " 켜는 중…" : " 끄는 중…"));
   await refresh();
   try {
     const res = await fetch("/api/profiles/" + encodeURIComponent(p.id) + (on ? "/on" : "/off"), {
@@ -89,9 +98,9 @@ async function toggle(p, on) {
       body: "{}",
     });
     const data = await res.json();
-    show(notice, p.name + ": " + (data.message || (data.ok ? "완료" : "실패")));
+    show(notice, (p.title || p.name) + ": " + (data.message || (data.ok ? "완료" : "실패")));
   } catch (e) {
-    show(notice, p.name + ": 요청을 보내지 못했습니다.");
+    show(notice, (p.title || p.name) + ": 요청을 보내지 못했습니다.");
   } finally {
     busy.delete(p.id);
     await refresh();

@@ -47,9 +47,9 @@ Mac 에는 VPN 을 켜지 않는다. VPN마다 컨테이너 하나(OpenVPN 클�
 **1. ovpn 을 넣는다.** VPN 하나에 폴더 하나, 폴더 안에 `.ovpn` 은 1개만.
 
 ```sh
-cp ~/Downloads/회사A.ovpn ovpn/vpn-a/client.ovpn
-cp ~/Downloads/회사B.ovpn ovpn/vpn-b/client.ovpn
-cp ~/Downloads/회사C.ovpn ovpn/vpn-c/client.ovpn
+cp ~/Downloads/회사A.ovpn ovpn/vpn-a/
+cp ~/Downloads/회사B.ovpn ovpn/vpn-b/
+cp ~/Downloads/회사C.ovpn ovpn/vpn-c/
 ```
 
 - 파일 이름은 `.ovpn` 으로 끝나면 무엇이든 된다.
@@ -88,6 +88,11 @@ VPN_GUI_PORT=8031 python3 gui/server.py
 
 화면에 보이는 것: compose 에 정의된 VPN 목록, 켜기·끄기 버튼, 상태(연결됨 / 연결 중 / 실패와 사유 / 꺼짐),
 SOCKS5 주소·포트, ovpn 폴더와 `.ovpn` 파일 수, 최근 로그 40줄.
+
+VPN 카드의 제목은 그 폴더에 넣은 `.ovpn` 파일 이름(확장자 뺌)이고, 부제는 그 ovpn 이 접속하는 서버
+(`remote` 의 호스트:포트/프로토콜)다. 폴더 이름(`vpn-a`)과 로컬 포트는 그 아래 작게 나온다.
+화면 서버는 ovpn 에서 `remote`·`port`·`proto` 줄만 읽는다(인증서·키 블록은 읽어 쓰지 않는다).
+`.ovpn` 이 없거나 2개 이상이면 제목은 폴더 이름이다.
 
 - 켜기 = `docker compose up -d --no-build <서비스>`, 끄기 = `docker compose stop <서비스>`.
 - 실패한 VPN 은 컨테이너가 10초마다 다시 시도한다. 멈추려면 끄기를 누른다.

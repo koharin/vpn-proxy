@@ -6,6 +6,7 @@
 
 하는 일
   - compose 에 정의된 VPN(프로필) 목록, 상태, SOCKS5 포트, 최근 로그를 보여 준다.
+  - 프로필 제목은 그 폴더의 .ovpn 파일 이름, 부제는 그 ovpn 이 접속하는 서버(remote 호스트:포트/프로토콜)다.
   - 켜기 = docker compose up -d --no-build <서비스>,  끄기 = docker compose stop <서비스>.
 
 지키는 것
@@ -14,7 +15,8 @@
   - 상태를 바꾸는 요청은 POST 뿐이고, Origin 이 이 화면 자신일 때만 받는다. GET 은 아무것도 바꾸지 않는다.
   - 다룰 수 있는 대상은 compose 에 정의된 서비스 이름뿐이다. 요청 값은 그 목록과 비교만 한다.
   - ovpn 을 올리거나 고치는 기능은 없다. ovpn 검사(check-ovpn.sh)는 컨테이너가 시작할 때 그대로 돈다.
-  - ovpn·auth.txt 의 내용은 읽지 않는다(.ovpn 파일이 몇 개인지만 센다). 로그는 가려서 보여 준다.
+  - ovpn 에서는 파일 이름과 remote·port·proto 줄만 읽는다. 인증서·키 블록과 그 밖의 줄, auth.txt 는
+    읽어 쓰지 않는다. 로그는 가려서 보여 준다.
   - 명령은 인자 목록으로만 실행한다(셸을 거치지 않는다).
 """
 import json
@@ -70,6 +72,58 @@ _CONTROL = re.compile(r"[\x00-\x08\x0b-\x1f\x7f-\x9f]")
 _ANSI = re.compile(r"\x1b\[[0-9;?]*[ -/]*[@-~]")
 HIDDEN = "[가림]"
 LINE_SCAN_MAX = 2000  # 가리기 전에 줄을 이 길이로 자른다(아주 긴 줄에서 검사 시간이 길이의 제곱으로 늘지 않게)
+
+# ovpn 에서 화면에 내는 것은 접속할 서버뿐이다. 값은 아래 모양일 때만 쓴다.
+OVPN_READ_MAX = 256 * 1024
+TITLE_MAX = 80
+_REMOTE_HOST = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,252}$")
+_REMOTE_PROTO = re.compile(r"^(?:udp|tcp)[46]?(?:-client)?$")
+_BLOCK_OPEN = re.compile(r"^<([a-z0-9-]+)>$")
+
+
+def _port(word):
+    return word if word.isdigit() and 1 <= int(word) <= 65535 else None
+
+
+def ovpn_target(path):
+    """ovpn 이 접속하는 서버: ("호스트:포트/프로토콜", 그 밖의 remote 수). 못 읽으면 ("", 0).
+
+    remote·port·proto 줄만 본다. <ca>·<key>·<tls-crypt> 같은 블록 안쪽은 건너뛴다.
+    """
+    try:
+        if os.path.islink(path):
+            return "", 0
+        with open(path, "rb") as f:
+            text = f.read(OVPN_READ_MAX).decode("utf-8", "replace")
+    except OSError:
+        return "", 0
+    remotes, port, proto, skip = [], None, None, ""
+    for raw in text.splitlines():
+        line = raw.strip()
+        if skip:
+            if line == "</" + skip + ">":
+                skip = ""
+            continue
+        m = _BLOCK_OPEN.match(line)
+        if m:
+            if m.group(1) != "connection":
+                skip = m.group(1)
+            continue
+        words = line.split()
+        if len(words) < 2:
+            continue
+        if words[0] == "remote" and _REMOTE_HOST.match(words[1]):
+            remotes.append((words[1], _port(words[2]) if len(words) > 2 else None, words[3] if len(words) > 3 and _REMOTE_PROTO.match(words[3]) else None))
+        elif words[0] == "port" and port is None:
+            port = _port(words[1])
+        elif words[0] == "proto" and proto is None and _REMOTE_PROTO.match(words[1]):
+            proto = words[1]
+    if not remotes:
+        return "", 0
+    host, rport, rproto = remotes[0]
+    if ":" in host:
+        host = "[" + host + "]"
+    return f"{host}:{rport or port or '1194'}/{rproto or proto or 'udp'}", len(remotes) - 1
 
 
 def redact_line(line):
@@ -196,12 +250,38 @@ class Manager:
         return None
 
     @staticmethod
-    def _ovpn_count(folder):
-        """폴더의 .ovpn 파일 수(내용은 읽지 않는다). 폴더가 없으면 None."""
+    def _ovpn_names(folder):
+        """폴더의 .ovpn 파일 이름들. 폴더가 없으면 None."""
         try:
-            return sum(1 for f in os.scandir(folder) if f.is_file() and f.name.endswith(".ovpn"))
-        except OSError:
+            return sorted(f.name for f in os.scandir(folder) if f.is_file() and f.name.endswith(".ovpn"))
+        except (OSError, TypeError):
             return None
+
+    def _base_view(self, profile):
+        """컨테이너 상태와 무관한 표시 값. .ovpn 이 1개일 때만 그 이름과 서버를 제목·부제로 쓴다."""
+        names = self._ovpn_names(profile["folder"]) if profile["folder"] else None
+        title, server, more = profile["name"], "", 0
+        if names is not None and len(names) == 1:
+            stem = _CONTROL.sub("", names[0][: -len(".ovpn")]).strip()[:TITLE_MAX]
+            title = stem or title
+            server, more = ovpn_target(os.path.join(profile["folder"], names[0]))
+        return {
+            "id": profile["id"],
+            "name": profile["name"],
+            "title": title,
+            "server": server,
+            "server_more": more,
+            "socks_port": profile["socks_port"],
+            "socks_host": profile["socks_host"],
+            "folder": self._folder_label(profile["folder"]),
+            "ovpn_files": len(names) if names is not None else None,
+            "state": OFF,
+            "message": "",
+            "since": "",
+            "dns": [],
+            "restarts": 0,
+            "log": [],
+        }
 
     def _folder_label(self, folder):
         try:
@@ -229,20 +309,7 @@ class Manager:
         return ""
 
     def status(self, profile, with_logs=True):
-        view = {
-            "id": profile["id"],
-            "name": profile["name"],
-            "socks_port": profile["socks_port"],
-            "socks_host": profile["socks_host"],
-            "folder": self._folder_label(profile["folder"]),
-            "ovpn_files": self._ovpn_count(profile["folder"]) if profile["folder"] else None,
-            "state": OFF,
-            "message": "",
-            "since": "",
-            "dns": [],
-            "restarts": 0,
-            "log": [],
-        }
+        view = self._base_view(profile)
         rc, out, _ = self.docker.run(["inspect", "--format", "{{json .State}} {{.RestartCount}}", "--", profile["container"]])
         if rc != 0:
             return view  # 컨테이너가 없다 = 꺼짐
@@ -312,20 +379,9 @@ class Manager:
         return {"docker": True, "error": "", "profiles": [self.status(p) for p in items]}
 
     def status_offline(self, profile):
-        return {
-            "id": profile["id"],
-            "name": profile["name"],
-            "socks_port": profile["socks_port"],
-            "socks_host": profile["socks_host"],
-            "folder": self._folder_label(profile["folder"]),
-            "ovpn_files": self._ovpn_count(profile["folder"]) if profile["folder"] else None,
-            "state": UNKNOWN,
-            "message": "Docker 가 꺼져 있어 상태를 알 수 없습니다.",
-            "since": "",
-            "dns": [],
-            "restarts": 0,
-            "log": [],
-        }
+        view = self._base_view(profile)
+        view["state"], view["message"] = UNKNOWN, "Docker 가 꺼져 있어 상태를 알 수 없습니다."
+        return view
 
     # ── 켜기·끄기 ──────────────────────────────────────────────────────────
     def switch(self, profile_id, on):

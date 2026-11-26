@@ -80,6 +80,12 @@ printf 'client\ndev tun\nremote 192.0.2.1 1194 udp\nca nonexistent-on-purpose.cr
 run_once dead "$TMP/dead"
 if [ $rc -ne 0 ] && echo "$out" | grep -q "연결 전에 끝났습니다"; then ok "OpenVPN 이 시작에 실패 → 종료 코드 $rc, 안내 문구"; else bad "OpenVPN 실패: rc=$rc out=$out"; fi
 
+# 파일 이름은 무엇이든 된다(공백 포함). 이름으로 고르지 않고 폴더의 .ovpn 1개를 집는다.
+mkdir -p "$TMP/spacename"
+cp "$TMP/dead/client.ovpn" "$TMP/spacename/My VPN 1.ovpn"
+run_once spacename "$TMP/spacename"
+if [ $rc -ne 0 ] && echo "$out" | grep -q "OpenVPN 시작: My VPN 1.ovpn" && echo "$out" | grep -q "연결 전에 끝났습니다"; then ok "공백이 든 .ovpn 이름도 그대로 집어 OpenVPN 까지 넘김"; else bad "공백 이름: rc=$rc out=$out"; fi
+
 run_once badname "$TMP/dead" -e 'VPN_NAME=a"b'
 if [ $rc -ne 0 ] && echo "$out" | grep -q "VPN_NAME"; then ok "VPN_NAME 에 따옴표 → 시작하지 않음"; else bad "VPN_NAME 검사 없음: $out"; fi
 run_once baddns "$TMP/dead" -e VPN_DNS=127.0.0.11
