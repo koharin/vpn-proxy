@@ -21,10 +21,12 @@ import server as gui  # noqa: E402
 FAKE_DOCKER = r'''#!/usr/bin/env python3
 import json, os, sys
 d = os.environ["FAKE_DIR"]
-with open(os.path.join(d, "calls"), "a") as f:
+with open(os.path.join(d, "calls.raw"), "a") as f:
     f.write(json.dumps(sys.argv[1:]) + "\n")
+with open(os.path.join(d, "calls"), "a") as f:
+    f.write(json.dumps([x for x in sys.argv[1:] if x != "--"]) + "\n")
 state = json.load(open(os.path.join(d, "state.json")))
-a = sys.argv[1:]
+a = [x for x in sys.argv[1:] if x != "--"]
 if state.get("daemon") is False and a[0] != "compose":
     sys.stderr.write("failed to connect to the docker API\n"); sys.exit(1)
 if a[:2] == ["compose", "config"]:
@@ -94,6 +96,7 @@ class GuiTest(unittest.TestCase):
         (Path(self.tmp) / "state.json").write_text(json.dumps(self.state))
         if hasattr(self, "manager"):
             self.manager._cache = None
+            self.manager.forget_overview()
 
     def calls(self):
         p = Path(self.tmp) / "calls"
@@ -307,6 +310,116 @@ class GuiTest(unittest.TestCase):
         self.assertTrue(all(len(l) <= gui.LOG_LINE_MAX + 1 for l in a["log"]))
         self.assertIn("<img src=x onerror=alert(1)>", text)  # 글자 그대로 준다(화면은 textContent 로만 넣는다)
         self.assertNotIn("TOPSECRET", a["message"])
+
+    # ── 보안 검토 W1~W4 ────────────────────────────────────────────────────
+    def test_w1_cross_site_get_is_refused_and_overview_is_cached(self):
+        self.state["containers"] = {"vpn-proxy-a": {"State": {"Running": True, "Restarting": False}, "status": {"state": "up"}, "logs": ""}}
+        self.save()
+        for site in ("cross-site", "same-site", "weird"):
+            res, _ = self.req("GET", "/api/profiles", {"Sec-Fetch-Site": site, "Origin": "http://evil.example"})
+            self.assertEqual(res.status, 403, site)
+            self.assertEqual(self.req("GET", "/api/health", {"Sec-Fetch-Site": site})[0].status, 403)
+        self.assertEqual(self.calls(), [])  # 거절된 요청은 docker 를 부르지 않는다
+        for site in ("same-origin", "none"):
+            self.assertEqual(self.req("GET", "/api/profiles", {"Sec-Fetch-Site": site})[0].status, 200)
+        self.assertEqual(self.req("GET", "/", {"Sec-Fetch-Site": "cross-site"})[0].status, 200)  # 페이지 자체는 열린다(주소창·링크)
+        # 캐시: 짧은 시간 안의 반복·동시 요청은 docker 를 다시 부르지 않는다
+        once = len(self.calls())
+        self.assertGreater(once, 0)
+        threads = [threading.Thread(target=self.overview) for _ in range(20)]
+        [t.start() for t in threads]
+        [t.join() for t in threads]
+        self.assertEqual(len(self.calls()), once)
+        self.assertLessEqual(gui.OVERVIEW_TTL, 2)
+        # 시간이 지나면 다시 계산하고, 켜기·끄기 뒤에는 바로 새로 읽는다
+        self.manager._view_at -= gui.OVERVIEW_TTL + 0.1
+        self.overview()
+        self.assertEqual(len(self.calls()), once * 2 - 1)  # compose 설정은 따로 5초 캐시라 한 번 덜 부른다
+        self.post("/api/profiles/vpn-a/off")
+        before = len(self.calls())
+        self.overview()
+        self.assertGreater(len(self.calls()), before)
+
+    def test_w2_log_redaction_shapes(self):
+        S = "S3cr3tValue"
+        shapes = [
+            f"Authorization: Bearer {S}",
+            f"Authorization: Basic {S}",
+            f"proxy-authorization: Digest username=x, response={S}",
+            f"the password is {S}",
+            f'password="first {S}"',
+            f"connecting to socks5://user:{S}@10.0.0.1:1080",
+            f"pwd={S}",
+            f"pw: {S}",
+            f"credentials: {S}",
+            f"private_key={S}",
+            f"Set-Cookie: session={S}; Path=/",
+            f"MY_PASSWORD={S}",
+            f"DB_PASSWORD_FILE: {S}",
+            f"api-key {S}",
+            f"Private Key: {S}",
+        ]
+        for line in shapes:
+            self.assertNotIn(S, gui.redact_line(line), line)
+        self.assertEqual(gui.redact_line(f"x://user:{S}@h/p"), "x://user:[가림]@h/p")
+        # 본문 마지막의 짧은 줄까지 통째로 빠진다
+        pem = "before\n-----BEGIN CERTIFICATE-----\nMIIBshortline==\nQUJDRA==\n-----END CERTIFICATE-----\nafter"
+        self.assertEqual(gui.redact_log(pem), ["before", "[가림: 인증서·키 본문]", "after"])
+        # 시작 줄이 잘려 나간 경우와 끝 줄이 아직 없는 경우
+        self.assertEqual(gui.redact_log("keep this line\nQUJDRUZHSElK\nQUJDRA==\n-----END PRIVATE KEY-----\nafter"), ["keep this line", "[가림: 인증서·키 본문]", "after"])
+        self.assertEqual(gui.redact_log("a\n-----BEGIN PRIVATE KEY-----\nQUJDRA==\nQUJD"), ["a", "[가림: 인증서·키 본문]"])
+        # 평범한 줄은 그대로 둔다
+        for plain in (
+            "[vpn-a] SOCKS5 시작: 컨테이너 포트 1080 (터널 연결됨)",
+            "2026-11-26 01:00:00 Initialization Sequence Completed",
+            "[vpn-a] 오류: 이 ovpn 은 아이디·비밀번호가 필요합니다(auth-user-pass). ovpn 과 같은 폴더에 auth.txt 를 넣으세요.",
+            "2026-11-26 01:00:00 TCP/UDP: Preserving recently used remote address: [AF_INET]10.0.0.1:1194",
+            "bypass compass passenger tokenizer",
+        ):
+            self.assertEqual(gui.redact_line(plain), plain)
+        readme = (REPO / "README.md").read_text()
+        self.assertIn("알려진 모양", readme)
+        self.assertIn("모든 비밀을 찾아내지는 못하므로", readme)
+
+    def test_w3_names_starting_with_dash_are_not_used(self):
+        services = self.state["compose"]["services"]
+        services["-x"] = dict(services["vpn-a"], container_name="vpn-proxy-x")
+        services["--help"] = dict(services["vpn-a"], container_name="vpn-proxy-h")
+        services["vpn-d"] = dict(services["vpn-a"], container_name="-rf")
+        services[".hidden"] = dict(services["vpn-a"], container_name="vpn-proxy-hid")
+        self.save()
+        self.assertEqual(sorted(self.by_id(self.overview())), ["vpn-a", "vpn-b", "vpn-c"])
+        for name in ("-x", "--help", "vpn-d", ".hidden", "-", "_a"):
+            status, body = self.post(f"/api/profiles/{name}/on")
+            self.assertIn(status, (404, 409), name)
+        self.assertEqual(self.changing_calls(), [])
+        # 이름 앞에는 항상 '--' 를 둔다(이름이 옵션으로 읽히지 않게)
+        self.state["containers"] = {"vpn-proxy-a": {"State": {"Running": True, "Restarting": False}, "status": {"state": "up"}, "logs": ""}}
+        self.save()
+        self.overview()
+        self.post("/api/profiles/vpn-a/on")
+        self.post("/api/profiles/vpn-a/off")
+        raw = [json.loads(l) for l in (Path(self.tmp) / "calls.raw").read_text().splitlines()]
+        named = [c for c in raw if c[0] in ("inspect", "logs", "exec") or c[:2] in (["compose", "up"], ["compose", "stop"])]
+        self.assertEqual({c[0] if c[0] != "compose" else c[1] for c in named}, {"inspect", "logs", "exec", "up", "stop"})
+        for c in named:
+            i = c.index("--")
+            self.assertIn(c[i + 1], ("vpn-a", "vpn-proxy-a", "vpn-proxy-b", "vpn-proxy-c"), c)
+            self.assertFalse(any(x in ("vpn-a", "vpn-proxy-a") for x in c[:i]), c)
+
+    def test_w4_half_sent_request_is_dropped(self):
+        self.assertEqual(self.server.RequestHandlerClass.timeout, gui.REQUEST_TIMEOUT)
+        self.assertLessEqual(gui.REQUEST_TIMEOUT, 10)
+        self.server.RequestHandlerClass.timeout = 1  # 시험에서는 짧게
+        try:
+            s = socket.create_connection(("127.0.0.1", self.port), timeout=5)
+            s.sendall(b"GET /api/profiles HTTP/1.1\r\nHost: 127.0.0.1")  # 머리말을 끝내지 않는다
+            s.settimeout(5)
+            self.assertEqual(s.recv(1024), b"")  # 서버가 연결을 끊는다
+            s.close()
+        finally:
+            self.server.RequestHandlerClass.timeout = gui.REQUEST_TIMEOUT
+        self.assertEqual(self.overview()["ok"], True)  # 그 뒤에도 정상 응답
 
     def test_repo_files(self):
         self.assertIn("!rootfs/", (REPO / ".dockerignore").read_text())  # 화면 코드는 이미지에 들어가지 않는다

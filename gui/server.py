@@ -37,7 +37,10 @@ STATIC_FILES = {
     "/app.js": ("app.js", "text/javascript; charset=utf-8"),
     "/style.css": ("style.css", "text/css; charset=utf-8"),
 }
-NAME_RE = re.compile(r"^[A-Za-z0-9._-]{1,32}$")
+# 서비스·컨테이너 이름. 첫 글자는 영문·숫자여야 한다('-' 로 시작하면 docker 가 옵션으로 읽는다).
+NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,31}$")
+OVERVIEW_TTL = 1.5  # 목록·상태 결과를 이 시간(초) 동안 다시 쓴다
+REQUEST_TIMEOUT = 10  # 연결 하나가 요청을 보내는 데 쓸 수 있는 시간(초)
 LOG_LINES = 40
 LOG_LINE_MAX = 300
 MAX_BODY = 1024
@@ -48,29 +51,64 @@ ACTION_TIMEOUT = 90
 OFF, CONNECTING, UP, FAILED, UNKNOWN = "off", "connecting", "up", "failed", "unknown"
 INNER_TO_VIEW = {"starting": CONNECTING, "connecting": CONNECTING, "reconnecting": CONNECTING, "up": UP, "stopped": FAILED}
 
-# 로그에서 가릴 것: 비밀번호·토큰처럼 보이는 값, 인증서·키 본문.
-_SECRET_KV = re.compile(r"(?i)\b(pass(?:word|wd|phrase)?|secret|token|api[_-]?key|authorization|auth-token)\b(\s*[:=]\s*|\s+)(\S+)")
-_PEM = re.compile(r"-----BEGIN [A-Z0-9 ]+-----|-----END [A-Z0-9 ]+-----")
+# 로그에서 가릴 것. 알려진 모양만 가린다(모든 비밀을 찾아내지는 못한다).
+#   이름 뒤의 값: password=…, MY_PASSWORD: …, pwd …, private_key=…, "password is …" → 줄 끝까지
+#   머리말: Authorization: …, Cookie: …, Set-Cookie: … → 줄 끝까지
+#   주소 안의 비밀번호: scheme://이름:값@호스트
+#   인증서·키: BEGIN~END 사이 줄 통째, 길게 이어진 base64 덩어리
+_SECRET_NAMES = r"pass(?:word|wd|phrase)?|pwd|pw|secret|token|api[_-]?key|credentials?|cookie|private[ _-]?key|auth-token"
+_SECRET_KV = re.compile(
+    r"(?i)(?<![A-Za-z0-9])((?:[A-Za-z0-9]+[_-])*(?:" + _SECRET_NAMES + r")(?:[_-][A-Za-z0-9]+)*)(?![A-Za-z0-9_-])(\s*[:=]\s*|\s+is\s+|\s+)(\S.*)$"
+)
+_HEADER = re.compile(r"(?i)(?<![A-Za-z0-9-])((?:proxy-)?authorization|set-cookie|cookie)(\s*[:=]\s*)(\S.*)$")
+_URL_USERINFO = re.compile(r"([A-Za-z][A-Za-z0-9+.-]*://[^\s/:@]*):[^\s/@]+@")
+_PEM_BEGIN = re.compile(r"-----BEGIN [A-Z0-9 ]+-----")
+_PEM_END = re.compile(r"-----END [A-Z0-9 ]+-----")
+_B64_ONLY = re.compile(r"^\s*[A-Za-z0-9+/=]{8,}\s*$")
 _B64_LONG = re.compile(r"[A-Za-z0-9+/=]{48,}")
 _CONTROL = re.compile(r"[\x00-\x08\x0b-\x1f\x7f-\x9f]")
 _ANSI = re.compile(r"\x1b\[[0-9;?]*[ -/]*[@-~]")
+HIDDEN = "[가림]"
 
 
 def redact_line(line):
     """로그 한 줄을 화면에 내도 되는 모양으로 바꾼다."""
     line = _ANSI.sub("", line)
     line = _CONTROL.sub("", line)
-    line = _PEM.sub("[가림]", line)
-    line = _SECRET_KV.sub(lambda m: m.group(1) + m.group(2) + "[가림]", line)
-    line = _B64_LONG.sub("[가림]", line)
+    line = _PEM_BEGIN.sub(HIDDEN, line)
+    line = _PEM_END.sub(HIDDEN, line)
+    line = _HEADER.sub(lambda m: m.group(1) + m.group(2) + HIDDEN, line)
+    line = _URL_USERINFO.sub(lambda m: m.group(1) + ":" + HIDDEN + "@", line)
+    line = _SECRET_KV.sub(lambda m: m.group(1) + m.group(2) + HIDDEN, line)
+    line = _B64_LONG.sub(HIDDEN, line)
     if len(line) > LOG_LINE_MAX:
         line = line[:LOG_LINE_MAX] + "…"
     return line
 
 
 def redact_log(text, limit=LOG_LINES):
-    lines = [redact_line(l) for l in text.splitlines() if l.strip()]
-    return lines[-limit:]
+    """로그 여러 줄. 인증서·키는 BEGIN~END 사이를 통째로 한 줄로 바꾼다."""
+    out = []
+    in_pem = False
+    for raw in text.splitlines():
+        if not raw.strip():
+            continue
+        if in_pem:
+            if _PEM_END.search(raw):
+                in_pem = False
+            continue
+        if _PEM_BEGIN.search(raw):
+            out.append("[가림: 인증서·키 본문]")
+            in_pem = not _PEM_END.search(raw)
+            continue
+        if _PEM_END.search(raw):
+            # 시작 줄이 잘려 나간 본문: 바로 앞의 base64 줄들을 지운다
+            while out and _B64_ONLY.match(out[-1].replace(HIDDEN, "AAAAAAAA")):
+                out.pop()
+            out.append("[가림: 인증서·키 본문]")
+            continue
+        out.append(redact_line(raw))
+    return out[-limit:]
 
 
 class Docker:
@@ -97,6 +135,9 @@ class Manager:
         self._cache = None
         self._cache_at = 0.0
         self._lock = threading.Lock()  # 켜기·끄기는 한 번에 하나씩
+        self._view = None
+        self._view_at = 0.0
+        self._view_lock = threading.Lock()  # 목록·상태 계산은 한 번에 하나씩
 
     # ── 프로필(compose 서비스) ──────────────────────────────────────────────
     def profiles(self, max_age=5.0):
@@ -171,7 +212,7 @@ class Manager:
         return rc == 0
 
     def logs(self, profile):
-        rc, out, err = self.docker.run(["logs", "--tail", "200", profile["container"]])
+        rc, out, err = self.docker.run(["logs", "--tail", "200", "--", profile["container"]])
         if rc != 0:
             return []
         return redact_log(out + err)
@@ -199,7 +240,7 @@ class Manager:
             "restarts": 0,
             "log": [],
         }
-        rc, out, _ = self.docker.run(["inspect", "--format", "{{json .State}} {{.RestartCount}}", profile["container"]])
+        rc, out, _ = self.docker.run(["inspect", "--format", "{{json .State}} {{.RestartCount}}", "--", profile["container"]])
         if rc != 0:
             return view  # 컨테이너가 없다 = 꺼짐
         try:
@@ -218,7 +259,7 @@ class Manager:
             return view
         if not st.get("Running"):
             return view  # 멈춰 있음 = 꺼짐
-        rc, out, _ = self.docker.run(["exec", profile["container"], "cat", "/run/vpn/status.json"])
+        rc, out, _ = self.docker.run(["exec", "--", profile["container"], "cat", "/run/vpn/status.json"])
         inner = {}
         if rc == 0:
             try:
@@ -239,6 +280,18 @@ class Manager:
         return view
 
     def overview(self):
+        """목록과 상태. 결과를 잠깐 다시 쓰고, 계산은 한 번에 하나만 한다(요청이 몰려도 docker 를 겹쳐 부르지 않는다)."""
+        with self._view_lock:
+            now = time.monotonic()
+            if self._view is None or now - self._view_at >= OVERVIEW_TTL:
+                self._view = self._overview()
+                self._view_at = time.monotonic()
+            return self._view
+
+    def forget_overview(self):
+        self._view = None
+
+    def _overview(self):
         items, error = self.profiles()
         if items is None:
             return {"docker": False, "error": error, "profiles": []}
@@ -276,12 +329,13 @@ class Manager:
             return False, "다른 켜기·끄기가 진행 중입니다. 잠시 뒤 다시 하세요."
         try:
             if on:
-                args = ["compose", "up", "-d", "--no-build", profile["id"]]
+                args = ["compose", "up", "-d", "--no-build", "--", profile["id"]]
             else:
-                args = ["compose", "stop", profile["id"]]
+                args = ["compose", "stop", "--", profile["id"]]
             rc, _, err = self.docker.run(args, timeout=ACTION_TIMEOUT)
         finally:
             self._lock.release()
+            self.forget_overview()
         if rc == 0:
             return True, ("켰습니다. 연결 상태는 아래에 표시됩니다." if on else "껐습니다.")
         low = err.lower()
@@ -312,6 +366,7 @@ def make_handler(manager, port):
         server_version = "vpn-proxy-gui"
         sys_version = ""
         protocol_version = "HTTP/1.1"
+        timeout = REQUEST_TIMEOUT  # 요청을 반쯤 보내고 멈춘 연결을 끊는다
 
         def log_message(self, fmt, *args):  # 요청 값은 로그에 남기지 않는다
             pass
@@ -340,6 +395,9 @@ def make_handler(manager, port):
             if path in STATIC_FILES:
                 name, ctype = STATIC_FILES[path]
                 return self._send(200, (STATIC / name).read_bytes(), ctype)
+            # 다른 웹사이트가 브라우저를 시켜 부른 요청은 받지 않는다(docker 를 반복 실행시키지 못하게).
+            if path.startswith("/api/") and self.headers.get("Sec-Fetch-Site", "none") not in ("same-origin", "none"):
+                return self._fail(403, "허용되지 않은 출처입니다.")
             if path == "/api/profiles":
                 return self._send(200, {"ok": True, **manager.overview()})
             if path == "/api/health":
@@ -362,7 +420,7 @@ def make_handler(manager, port):
             parts = urlsplit(self.path)
             if parts.query:
                 return self._fail(400, "주소에 값을 붙일 수 없습니다.")
-            m = re.match(r"^/api/profiles/([A-Za-z0-9._-]{1,32})/(on|off)$", parts.path)
+            m = re.match(r"^/api/profiles/([A-Za-z0-9][A-Za-z0-9._-]{0,31})/(on|off)$", parts.path)
             if not m:
                 return self._fail(404, "없는 주소입니다.")
             try:
