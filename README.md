@@ -75,6 +75,36 @@ curl --socks5-hostname 127.0.0.1:1081 http://10.0.0.10/    # vpn-a 안의 서버
 
 멈추기: `docker compose down`. 하나만 다시: `docker compose restart vpn-b`.
 
+## 웹 화면
+
+켜고 끄기와 상태 확인을 브라우저에서 한다. Mac 에서 도는 작은 서버가 이 폴더의 `docker compose` 를 대신 부른다.
+필요한 것은 Mac 에 이미 있는 `python3` 뿐이다(설치할 것 없음).
+
+```sh
+docker compose build                 # 처음 한 번(화면의 '켜기'는 이미지를 빌드하지 않는다)
+python3 gui/server.py                # http://127.0.0.1:8030   끝내기: Ctrl+C
+VPN_GUI_PORT=8031 python3 gui/server.py
+```
+
+화면에 보이는 것: compose 에 정의된 VPN 목록, 켜기·끄기 버튼, 상태(연결됨 / 연결 중 / 실패와 사유 / 꺼짐),
+SOCKS5 주소·포트, ovpn 폴더와 `.ovpn` 파일 수, 최근 로그 40줄.
+
+- 켜기 = `docker compose up -d --no-build <서비스>`, 끄기 = `docker compose stop <서비스>`.
+- 실패한 VPN 은 컨테이너가 10초마다 다시 시도한다. 멈추려면 끄기를 누른다.
+- ovpn 은 올릴 수 없다. `ovpn/<이름>/` 폴더에 직접 넣는다. ovpn 검사는 컨테이너가 시작할 때 그대로 돌고,
+  거부되면 화면에 '실패'와 사유가 뜬다.
+- VPN 을 늘리려면 compose 에 서비스를 추가한다("VPN 추가"). 화면은 compose 를 읽어 목록을 만든다.
+
+지키는 것:
+
+- `127.0.0.1` 에만 연다. 주소는 바꿀 수 없고 포트만 바꾼다. 로그인은 없다 — 이 Mac 의 사용자만 쓴다고 본다.
+- 상태를 바꾸는 요청은 POST 뿐이고, 이 화면 자신이 보낸 것(Origin·Host 가 `127.0.0.1`/`localhost` 의 그 포트)만 받는다.
+  다른 웹사이트가 브라우저를 시켜 VPN 을 켜고 끌 수 없다.
+- 다룰 수 있는 대상은 compose 에 정의된 서비스뿐이다.
+- ovpn·`auth.txt` 의 내용은 읽지 않는다. 로그는 비밀번호·토큰·키처럼 보이는 값을 가리고 보여 준다.
+
+시험: `python3 tests/gui_test.py` (진짜 docker 를 부르지 않는다).
+
 ## 쓰는 법
 
 ### SSH

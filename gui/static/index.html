@@ -1,0 +1,26 @@
+<!doctype html>
+<html lang="ko">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>vpn-proxy</title>
+<link rel="stylesheet" href="/style.css">
+</head>
+<body>
+<header>
+  <h1>vpn-proxy</h1>
+  <p class="sub">VPN 마다 로컬 SOCKS5 포트가 하나씩 있습니다. 켜고 끄기와 상태 확인만 합니다.</p>
+</header>
+<main>
+  <p id="banner" class="banner" hidden></p>
+  <p id="notice" class="notice" role="status" hidden></p>
+  <section id="list" aria-live="polite"></section>
+  <p id="empty" class="muted" hidden>compose 에 정의된 VPN 이 없습니다.</p>
+</main>
+<footer class="muted">
+  ovpn 파일은 <code>ovpn/&lt;이름&gt;/</code> 폴더에 직접 넣습니다(이 화면에서는 올리지 않습니다).
+  <span id="updated"></span>
+</footer>
+<script src="/app.js"></script>
+</body>
+</html>
