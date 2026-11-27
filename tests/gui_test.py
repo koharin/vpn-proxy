@@ -1066,6 +1066,91 @@ class GuiTest(unittest.TestCase):
         # replace 를 켰어도 없는 이름이면 새로 등록한다
         self.assertIn("등록했습니다", self.upload("fresh", replace=True)[1]["message"])
 
+    def test_replace_keeps_an_ovpn_when_a_later_step_fails(self):
+        # 보안 검토 P2: 새 것으로 먼저 바꾼 뒤 예전 파일을 치운다. 치우다 실패해도 ovpn 없는 폴더는 남지 않는다.
+        self.use_checker()
+        self.assertEqual(self.upload(ovpn=FAKE_OVPN + "auth-user-pass\n", username="u", password=PW_MARK)[0], 200)
+        folder = Path(self.tmp) / "ovpn" / "office"
+        new = FAKE_OVPN.replace("vpn.example.invalid", "vpn2.example.invalid")
+        real = os.unlink
+
+        def failing(path, *a, **kw):
+            if str(path).endswith("auth.txt"):
+                raise OSError("no")
+            return real(path, *a, **kw)
+        gui.vpnstore.os.unlink = failing
+        try:
+            with self.assertRaises(OSError):
+                self.manager.store.replace("office", new)
+        finally:
+            gui.vpnstore.os.unlink = real
+        self.assertEqual((folder / "office.ovpn").read_text(), new)
+
+    def test_broken_registry_is_never_overwritten(self):
+        # 보안 검토 P3: 읽지 못한 vpns.json 은 조회·추가·수정·삭제 어느 것으로도 덮어쓰지 않는다.
+        self.use_checker()
+        self.assertEqual(self.upload()[0], 200)
+        reg, gen = Path(self.tmp) / "vpns.json", Path(self.tmp) / "compose.generated.yml"
+        store = self.manager.store
+        for broken in ('{"vpns": [{"name": "office", "po', "[]", '{"vpns": 3}'):
+            reg.write_text(broken)
+            gen.unlink()
+            self.assertTrue(store.broken())
+            store.compose_files()  # 빈 생성 파일만 만든다
+            self.assertEqual(json.loads(gen.read_text()), {"services": {}})
+            self.manager._cache = None
+            self.manager.forget_overview()
+            data = self.overview()
+            self.assertIn("vpns.json 을 읽지 못했습니다", data["error"])
+            self.assertEqual(data["profiles"], [])
+            status, answer = self.upload("other")
+            self.assertEqual(status, 409)
+            self.assertIn("덮어쓰지 않았습니다", answer["message"])
+            self.assertFalse((Path(self.tmp) / "ovpn" / "other").exists())
+            self.folder("good")
+            for argv in (("list",), ("import", "good"), ("set", "office", "--port", "2000"), ("forget", "office")):
+                rc, out = self.ctl(*argv)
+                self.assertEqual(rc, 1, argv)
+                self.assertIn("덮어쓰지 않았습니다", out)
+            shutil.rmtree(Path(self.tmp) / "ovpn" / "good")
+            for call in (lambda: store.remove("office"), lambda: store.replace("office", FAKE_OVPN), lambda: store.save([])):
+                with self.assertRaises(gui.vpnstore.Rejected):
+                    call()
+            self.assertEqual(reg.read_text(), broken)
+        # 없는 파일은 깨진 것이 아니다
+        reg.unlink()
+        self.assertFalse(store.broken())
+
+    def test_dns_octets_with_leading_zero_are_refused_on_both_sides(self):
+        # 보안 검토 P4: 00.x, 010.x 는 0.x 금지를 달리 적은 것이다. 화면 쪽(dns_list)과 컨테이너 쪽(ok_dns)이 같은 답을 낸다.
+        lib = REPO / "rootfs" / "vpn-lib.sh"
+        for value, good in (("00.0.0.0", False), ("010.0.0.1", False), ("10.01.0.1", False), ("10.0.0.00", False), ("0.1.2.3", False),
+                            ("127.0.0.1", False), ("10.0.0.1", True), ("10.0.0.0", True), ("100.64.0.10", True), ("8.8.8.8", True)):
+            self.assertEqual(gui.vpnstore.dns_list(value) is not None, good, value)
+            rc = gui.subprocess.run(["/bin/sh", "-c", '. "$1"; ok_dns "$2"', "sh", str(lib), value]).returncode
+            self.assertEqual(rc == 0, good, value)
+
+    def test_registry_writes_wait_for_the_lock(self):
+        # 웹 서버와 vpnctl 이 함께 돌 때: 다른 프로세스가 잠금을 쥐고 있으면 쓰지 않고 알린다.
+        import fcntl
+        self.use_checker()
+        self.assertEqual(self.upload()[0], 200)
+        before = (Path(self.tmp) / "vpns.json").read_text()
+        fd = os.open(self.tmp, os.O_RDONLY)
+        wait = gui.vpnstore.LOCK_WAIT
+        gui.vpnstore.LOCK_WAIT = 0.2
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX)
+            rc, out = self.ctl("set", "office", "--port", "2000")
+            self.assertEqual(rc, 1)
+            self.assertIn("쓰는 중", out)
+            self.assertEqual(self.upload("other")[0], 409)
+            self.assertEqual((Path(self.tmp) / "vpns.json").read_text(), before)
+        finally:
+            gui.vpnstore.LOCK_WAIT = wait
+            os.close(fd)
+        self.assertEqual(self.ctl("set", "office", "--port", "2000")[0], 0)   # 풀리면 된다
+
     def test_repo_files(self):
         self.assertIn("!rootfs/", (REPO / ".dockerignore").read_text())  # 화면 코드는 이미지에 들어가지 않는다
         src = (REPO / "gui" / "server.py").read_text()
@@ -1088,7 +1173,8 @@ class GuiTest(unittest.TestCase):
         self.assertNotRegex(base, r"(?m)^  vpn-[abc]:")   # 고정 슬롯이 없다
         self.assertNotIn("VPN_A_", base + (REPO / ".env.example").read_text())
         self.assertEqual(len(re.findall(r"(?<![.\w])open\(", store)), 0)   # 파일은 os.open 으로만 연다
-        self.assertEqual((store.count("os.open("), store.count("os.O_WRONLY")), (2, 2))   # 둘 다 쓰기 전용
+        # 파일을 여는 둘은 쓰기 전용이고, 나머지 하나는 잠금을 걸려고 root 폴더를 여는 것이다(파일 내용을 읽지 않는다)
+        self.assertEqual((store.count("os.open("), store.count("os.O_WRONLY"), store.count("os.open(self.root, os.O_RDONLY)")), (3, 2, 1))
         self.assertNotIn("$\")", store)   # 이름·비밀번호 검사는 fullmatch 로 한다
         ignore = (REPO / ".gitignore").read_text()
         for name in ("vpns.json", "compose.generated.yml"):

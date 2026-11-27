@@ -212,6 +212,8 @@ class Manager:
         now = time.monotonic()
         if self._cache is not None and now - self._cache_at < max_age:
             return self._cache, None
+        if self.store.broken():  # 깨진 등록부는 덮어쓰지 않는다. 알리기만 한다(보안 검토 P3).
+            return None, vpnstore.BROKEN
         rc, out, _ = self.docker.run([*self._compose(), "config", "--format", "json"])
         if rc != 0:
             return None, "compose 설정을 읽지 못했습니다(docker compose config 실패). docker 가 설치돼 있는지, .env 값을 확인하세요."

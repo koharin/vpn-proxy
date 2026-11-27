@@ -35,6 +35,8 @@ def main(argv=None, root=ROOT, out=sys.stdout):
     store = vpnstore.Store(root)
     try:
         if args.cmd == "list":
+            if store.broken():
+                raise vpnstore.Rejected(vpnstore.BROKEN)
             for e in store.entries():
                 print(f"{e['name']}\t127.0.0.1:{e['port']}\t{vpnstore.OVPN_DIR}/{e['name']}"
                       + ("\tDNS " + ",".join(e["dns"]) if e["dns"] else "") + ("\t(가져온 폴더)" if e["imported"] else ""), file=out)

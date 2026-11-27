@@ -15,12 +15,16 @@
   - 이 파일은 저장만 한다. ovpn·auth 파일을 다시 읽어 돌려주는 코드는 없다. 비밀번호는 응답·로그에 넣지 않는다.
   - 포트는 127.0.0.1 로만 연다.
 """
+import fcntl
+import functools
 import json
 import os
 import re
 import shutil
 import socket
 import subprocess
+import threading
+import time
 from pathlib import Path
 
 REGISTRY = "vpns.json"
@@ -60,11 +64,11 @@ _PATH_ARG = frozenset("ca cert key extra-certs pkcs12 dh crl-verify tls-auth tls
 _BLOCK = re.compile(r"^<(/?)([a-z0-9-]+)>")
 _CRED_OK = re.compile(r"[\x20-\x7e]{1,%d}" % CRED_MAX)
 _CHECK_LINE = re.compile(r"^\s{0,4}\S")
-_IPV4 = re.compile(r"(?:(?:25[0-5]|2[0-4][0-9]|1?[0-9]?[0-9])\.){3}(?:25[0-5]|2[0-4][0-9]|1?[0-9]?[0-9])")
+_IPV4 = re.compile(r"(?:(?:25[0-5]|2[0-4][0-9]|1[0-9][0-9]|[1-9]?[0-9])\.){3}(?:25[0-5]|2[0-4][0-9]|1[0-9][0-9]|[1-9]?[0-9])")
 
 
 def dns_list(value):
-    """DNS 주소 목록(IPv4, 127.x·0.x 제외, 최대 DNS_MAX 개). 모양이 다르면 None. 글자열이면 쉼표로 나눈다."""
+    """DNS 주소 목록(IPv4, 127.x·0.x 제외, 0 으로 시작하는 두 자리 이상 숫자(00, 010) 불가, 최대 DNS_MAX 개). 모양이 다르면 None. 글자열이면 쉼표로 나눈다."""
     if value in (None, "", []):
         return []
     items = [x.strip() for x in value.split(",")] if isinstance(value, str) else value
@@ -129,21 +133,77 @@ def scan(text):
     return needs_auth and not inline_auth, outside
 
 
+BROKEN = f"{REGISTRY} 을 읽지 못했습니다(내용이 깨졌거나 권한이 없습니다). 덮어쓰지 않았습니다. 파일을 고치거나 다른 곳으로 옮긴 뒤 다시 하세요."
+BUSY = "다른 프로그램이 등록부를 쓰는 중입니다. 잠시 뒤 다시 하세요."
+LOCK_WAIT = 5.0
+
+
+def _locked(method):
+    """등록부를 읽고 고쳐 쓰는 동안 root 폴더에 잠금을 건다(웹 서버와 vpnctl 이 함께 돌 때 겹쳐 쓰지 않게)."""
+    @functools.wraps(method)
+    def run(self, *args, **kwargs):
+        with self._guard:
+            if self._depth:
+                return method(self, *args, **kwargs)
+            fd = os.open(self.root, os.O_RDONLY)
+            try:
+                deadline = time.monotonic() + LOCK_WAIT
+                while True:
+                    try:
+                        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                        break
+                    except OSError:
+                        if time.monotonic() >= deadline:
+                            raise Rejected(BUSY) from None
+                        time.sleep(0.05)
+                self._depth = 1
+                try:
+                    return method(self, *args, **kwargs)
+                finally:
+                    self._depth = 0
+            finally:
+                os.close(fd)  # 닫으면 잠금도 풀린다
+    return run
+
+
 class Store:
     def __init__(self, root, port_free=port_free):
         self.root = Path(root)
         self.port_free = port_free
+        self._guard = threading.RLock()
+        self._depth = 0
 
     # ── 등록부 ──────────────────────────────────────────────────────────────
-    def entries(self):
-        """등록된 VPN [{name, port, dns, imported}]. 파일이 없거나 깨졌으면 모양이 맞는 것만."""
+    def _rows(self):
+        """(등록부의 줄들, 깨졌는지). 파일이 없으면 빈 것이고, 있는데 읽지 못하거나 모양이 다르면 깨진 것이다."""
+        path = self.root / REGISTRY
         try:
-            data = json.loads((self.root / REGISTRY).read_text(encoding="utf-8"))
+            text = path.read_text(encoding="utf-8")
+        except FileNotFoundError:
+            return [], path.is_symlink()
         except (OSError, ValueError):
-            return []
-        out, seen, ports = [], set(), set()
+            return [], True
+        try:
+            data = json.loads(text)
+        except ValueError:
+            return [], True
         rows = data.get("vpns") if isinstance(data, dict) else None
-        for e in rows if isinstance(rows, list) else []:
+        return (rows, False) if isinstance(rows, list) else ([], True)
+
+    def broken(self):
+        """등록부 파일이 있는데 읽을 수 없으면 True. 이때는 아무것도 쓰지 않는다(보안 검토 P3)."""
+        return self._rows()[1]
+
+    def _editable(self):
+        """고쳐 쓰려고 읽는 등록부. 깨져 있으면 덮어쓰지 않도록 거절한다."""
+        if self.broken():
+            raise Rejected(BROKEN)
+        return self.entries()
+
+    def entries(self):
+        """등록된 VPN [{name, port, dns, imported}]. 모양이 맞는 것만. 파일이 없거나 깨졌으면 빈 목록(broken() 으로 구분)."""
+        out, seen, ports = [], set(), set()
+        for e in self._rows()[0]:
             if not isinstance(e, dict):
                 continue
             name, port = e.get("name"), e.get("port")
@@ -165,8 +225,17 @@ class Store:
     def compose_files(self):
         """docker compose 에 넘길 -f 인자. 언제나 기본 파일과 생성 파일 둘이다(생성 파일이 없으면 빈 것을 만든다)."""
         if not self.generated_path().is_file():
-            self.save(self.entries())
+            self._make_generated()
         return ["-f", BASE_COMPOSE, "-f", GENERATED]
+
+    @_locked
+    def _make_generated(self):
+        if self.generated_path().is_file():
+            return
+        if self.broken():  # 등록부는 건드리지 않고 빈 생성 파일만 만든다
+            self._write(GENERATED, json.dumps({"services": {}}, indent=2) + "\n")
+        else:
+            self.save(self.entries())
 
     @staticmethod
     def service(entry):
@@ -193,6 +262,8 @@ class Store:
 
     def save(self, entries):
         """등록부와 생성 compose 를 함께 쓴다. compose 파일은 JSON 이다(YAML 은 JSON 을 그대로 읽는다)."""
+        if self.broken():
+            raise Rejected(BROKEN)
         rows = []
         for e in entries:
             row = {"name": e["name"], "port": e["port"], "folder": f"{OVPN_DIR}/{e['name']}"}
@@ -287,11 +358,12 @@ class Store:
         return port
 
     # ── 추가·교체·삭제 ─────────────────────────────────────────────────────
+    @_locked
     def add(self, name, ovpn, username="", password="", taken_ids=(), taken_containers=(), taken_ports=(), clean=lambda s: s):
         """올린 ovpn 을 저장하고 등록한다. 돌려주는 값은 {name, port, auth}. 문제가 있으면 Rejected."""
         folder = self._folder(name)
         data, needs_auth, username, password = self._upload(ovpn, username, password)
-        entries = self.entries()
+        entries = self._editable()
         if len(entries) >= MAX_VPNS:
             raise Rejected(f"등록할 수 있는 VPN 은 {MAX_VPNS}개까지입니다.")
         if name in taken_ids or name in {e["name"] for e in entries} or CONTAINER_PREFIX + name in taken_containers:
@@ -320,10 +392,11 @@ class Store:
             raise
         return {"name": name, "port": port, "auth": needs_auth}
 
+    @_locked
     def replace(self, name, ovpn, username="", password="", clean=lambda s: s):
         """웹에서 올린 VPN 의 ovpn 을 새 것으로 바꾼다. 포트와 이름은 그대로다. 새 것이 검사를 통과한 뒤에만 바꾼다."""
         folder = self._folder(name)
-        entry = next((e for e in self.entries() if e["name"] == name), None)
+        entry = next((e for e in self._editable() if e["name"] == name), None)
         if entry is None:
             raise Rejected("등록되지 않은 이름입니다.")
         if entry["imported"]:
@@ -339,10 +412,12 @@ class Store:
             reasons = self.check(tmp, clean)
             if reasons:
                 raise Rejected("ovpn 검사를 통과하지 못했습니다. 기존 것은 그대로 두었습니다.", reasons)
-            for f in list(os.scandir(folder)):  # 예전 ovpn·아이디 파일을 지운다(이 폴더는 올린 파일만 들어 있다)
-                if f.name != UPLOAD_TMP and (f.name.endswith(".ovpn") or f.name == AUTH_FILE) and not f.is_dir(follow_symlinks=False):
-                    os.unlink(f.path)
+            # 새 것으로 먼저 바꿔 놓고(같은 이름은 한 번에 덮어쓴다) 그 뒤에 예전 파일을 치운다.
+            # 뒤 단계가 실패해도 ovpn 이 없는 폴더는 남지 않는다(보안 검토 P2).
             os.replace(tmp, folder / (name + ".ovpn"))
+            for f in list(os.scandir(folder)):  # 다른 이름의 예전 ovpn·아이디 파일(이 폴더는 올린 파일만 들어 있다)
+                if f.name not in (UPLOAD_TMP, name + ".ovpn") and (f.name.endswith(".ovpn") or f.name == AUTH_FILE) and not f.is_dir(follow_symlinks=False):
+                    os.unlink(f.path)
             if needs_auth:
                 self._put(folder / AUTH_FILE, (username + "\n" + password + "\n").encode("ascii"))
         finally:
@@ -350,13 +425,14 @@ class Store:
                 os.unlink(tmp)
         return {"name": name, "port": entry["port"], "auth": needs_auth}
 
+    @_locked
     def import_folder(self, name, port=None, dns=None, clean=lambda s: s):
         """이미 있는 ovpn/<이름>/ 폴더를 등록한다(직접 넣은 것, 예전 방식에서 옮길 때). 포트를 정할 수 있다.
 
         폴더에는 .ovpn 이 1개 있어야 하고 검사를 통과해야 한다. 폴더를 0700, 안의 파일을 0600 으로 좁힌다.
         """
         folder = self._folder(name)
-        entries = self.entries()
+        entries = self._editable()
         if name in {e["name"] for e in entries}:
             raise Rejected("이미 등록된 이름입니다.")
         if len(entries) >= MAX_VPNS:
@@ -387,9 +463,10 @@ class Store:
         self.save(entries + [{"name": name, "port": port, "dns": dns, "imported": True}])
         return {"name": name, "port": port, "dns": dns}
 
+    @_locked
     def update(self, name, port=None, dns=None):
         """등록된 VPN 의 포트·DNS 를 바꾼다(None 이면 그대로). 컨테이너를 다시 띄워야 적용된다."""
-        entries = self.entries()
+        entries = self._editable()
         entry = next((e for e in entries if e["name"] == name), None)
         if entry is None:
             raise Rejected("등록되지 않은 이름입니다.")
@@ -407,15 +484,17 @@ class Store:
         self.save(entries)
         return {"name": name, "port": entry["port"], "dns": entry["dns"]}
 
+    @_locked
     def forget(self, name):
         """등록부에서만 뺀다(폴더는 그대로). 뺐으면 True."""
-        entries = self.entries()
+        entries = self._editable()
         rest = [e for e in entries if e["name"] != name]
         if len(rest) == len(entries):
             return False
         self.save(rest)
         return True
 
+    @_locked
     def remove(self, name):
         """등록부에서 빼고 ovpn/<이름> 폴더를 지운다. 가져온 폴더(직접 넣은 것)는 남긴다. 폴더가 없어졌으면 True.
 
@@ -423,7 +502,7 @@ class Store:
         그 파일과 폴더는 남긴다 — 등록부를 손으로 고쳐 다른 폴더 이름을 넣어도 통째로 지우지 않는다(보안 검토 U1).
         """
         folder = self._folder(name)
-        entry = next((e for e in self.entries() if e["name"] == name), None)
+        entry = next((e for e in self._editable() if e["name"] == name), None)
         if entry is None:
             raise Rejected("등록된 VPN 만 지울 수 있습니다.")
         self.forget(name)
