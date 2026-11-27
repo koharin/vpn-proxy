@@ -1,0 +1,55 @@
+:root {
+  --bg: #f6f7f9; --card: #ffffff; --text: #1b1f24; --muted: #5c6670; --line: #d9dee4;
+  --up: #1a7f37; --connecting: #9a6700; --failed: #b42318; --off: #6b7480; --accent: #0b57d0;
+  --logbg: #f0f2f5;
+}
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    --bg: #14171a; --card: #1d2125; --text: #e6e9ec; --muted: #9aa4ae; --line: #343a41;
+    --up: #4ac26b; --connecting: #d4a72c; --failed: #ff7b72; --off: #8b949e; --accent: #7aa7ff;
+    --logbg: #15181b;
+  }
+}
+* { box-sizing: border-box; }
+body { margin: 0; background: var(--bg); color: var(--text); font: 15px/1.5 -apple-system, "Apple SD Gothic Neo", "Segoe UI", sans-serif; }
+header, main, footer { max-width: 760px; margin: 0 auto; padding: 0 16px; }
+header { padding-top: 24px; }
+h1 { font-size: 22px; margin: 0; }
+.sub, .muted { color: var(--muted); }
+.sub { margin: 4px 0 16px; }
+footer { padding: 16px; font-size: 13px; }
+code { font-family: ui-monospace, Menlo, monospace; font-size: 0.92em; }
+.banner, .notice { padding: 10px 12px; border-radius: 8px; border: 1px solid var(--line); background: var(--card); margin: 0 0 12px; }
+.banner { border-color: var(--failed); color: var(--failed); }
+.card { background: var(--card); border: 1px solid var(--line); border-radius: 10px; padding: 14px 16px; margin-bottom: 12px; }
+.row { display: flex; align-items: center; gap: 12px; flex-wrap: wrap; }
+.name { font-size: 17px; font-weight: 600; margin: 0; overflow-wrap: anywhere; }
+.names { flex: 1 1 240px; min-width: 0; }
+.server { margin: 2px 0 0; font: 14px/1.4 ui-monospace, Menlo, monospace; overflow-wrap: anywhere; }
+.aux { margin: 2px 0 0; font-size: 12px; color: var(--muted); }
+.grow { flex: 1 1 auto; }
+.badge { display: inline-flex; align-items: center; gap: 6px; font-weight: 600; font-size: 13px; padding: 2px 10px; border-radius: 999px; border: 1px solid currentColor; }
+.badge::before { content: ""; width: 8px; height: 8px; border-radius: 50%; background: currentColor; }
+.s-up { color: var(--up); } .s-connecting { color: var(--connecting); } .s-failed { color: var(--failed); }
+.s-off, .s-unknown { color: var(--off); }
+.meta { margin: 8px 0 0; display: grid; grid-template-columns: max-content 1fr; gap: 2px 12px; font-size: 14px; }
+.meta dt { color: var(--muted); } .meta dd { margin: 0; overflow-wrap: anywhere; }
+.msg { margin: 8px 0 0; font-size: 14px; overflow-wrap: anywhere; }
+.msg.s-failed { font-weight: 600; }
+button { font: inherit; padding: 6px 16px; border-radius: 8px; border: 1px solid var(--accent); background: var(--accent); color: #fff; cursor: pointer; min-width: 72px; }
+@media (prefers-color-scheme: dark) { :root:not([data-theme="light"]) button { color: #10141a; } }
+button.off { background: transparent; color: var(--text); border-color: var(--line); }
+button:disabled { opacity: 0.5; cursor: default; }
+button:focus-visible, summary:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+details { margin-top: 10px; }
+summary { cursor: pointer; color: var(--muted); font-size: 14px; }
+pre { margin: 8px 0 0; padding: 10px; background: var(--logbg); border-radius: 8px; font: 12px/1.45 ui-monospace, Menlo, monospace; max-height: 260px; overflow: auto; white-space: pre-wrap; overflow-wrap: anywhere; }
+.form { display: grid; grid-template-columns: max-content 1fr; gap: 8px 12px; align-items: center; margin: 10px 0; font-size: 14px; }
+.form label { color: var(--muted); }
+.form input { font: inherit; padding: 6px 8px; border-radius: 8px; border: 1px solid var(--line); background: var(--bg); color: var(--text); min-width: 0; width: 100%; }
+.form input:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
+@media (max-width: 480px) { .form { grid-template-columns: 1fr; gap: 4px; } }
+.reasons { margin: 6px 0 0; padding-left: 20px; font: 13px/1.5 ui-monospace, Menlo, monospace; color: var(--failed); overflow-wrap: anywhere; }
+.danger { margin: 10px 0 0; font-size: 14px; }
+button.del { background: var(--failed); border-color: var(--failed); }
+.check { display: inline-flex; align-items: center; gap: 6px; font-size: 14px; color: var(--muted); }
