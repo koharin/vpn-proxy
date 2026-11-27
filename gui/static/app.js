@@ -76,7 +76,9 @@ function card(p, dockerOk) {
   if (p.managed) {
     const row = el("p", "row danger");
     if (asking.has(p.id)) {
-      row.append(el("span", "", "컨테이너를 멈추고 ovpn 폴더(" + (p.folder || p.id) + ")를 지웁니다. 되돌릴 수 없습니다."));
+      row.append(el("span", "", p.imported
+        ? "컨테이너를 멈추고 등록을 지웁니다. 직접 넣은 폴더(" + (p.folder || p.id) + ")는 남깁니다."
+        : "컨테이너를 멈추고 ovpn 폴더(" + (p.folder || p.id) + ")를 지웁니다. 되돌릴 수 없습니다."));
       const yes = el("button", "del", "삭제 확인");
       yes.type = "button";
       yes.disabled = !dockerOk || busy.has(p.id);
@@ -159,6 +161,7 @@ const addFile = document.getElementById("add-file");
 const addName = document.getElementById("add-name");
 const addUser = document.getElementById("add-user");
 const addPass = document.getElementById("add-pass");
+const addReplace = document.getElementById("add-replace");
 const addGo = document.getElementById("add-go");
 const addMsg = document.getElementById("add-msg");
 const addReasons = document.getElementById("add-reasons");
@@ -189,11 +192,11 @@ async function upload() {
     const res = await fetch("/api/vpns", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ name: addName.value, ovpn: text, username: addUser.value, password: addPass.value }),
+      body: JSON.stringify({ name: addName.value, ovpn: text, username: addUser.value, password: addPass.value, replace: addReplace.checked }),
     });
     const data = await res.json();
     addResult(data.message || (data.ok ? "등록했습니다." : "실패"), data.reasons);
-    if (data.ok) { addFile.value = ""; addName.value = ""; addUser.value = ""; }
+    if (data.ok) { addFile.value = ""; addName.value = ""; addUser.value = ""; addReplace.checked = false; }
   } catch (e) {
     addResult("요청을 보내지 못했습니다.");
   } finally {

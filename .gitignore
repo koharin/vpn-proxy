@@ -1,7 +1,6 @@
 # 실제 VPN 설정·인증서·비밀번호는 저장소에 넣지 않는다.
 ovpn/**
-!ovpn/*/
-!ovpn/*/.gitkeep
+!ovpn/.gitkeep
 .env
 *.ovpn
 *.key

@@ -4,6 +4,7 @@
   python3 tests/gui_test.py
 """
 import http.client
+import io
 import json
 import os
 import socket
@@ -19,23 +20,26 @@ from pathlib import Path
 REPO = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO / "gui"))
 import server as gui  # noqa: E402
+import vpnctl  # noqa: E402
 
 FAKE_DOCKER = r'''#!/usr/bin/env python3
 import json, os, sys
 d = os.environ["FAKE_DIR"]
 with open(os.path.join(d, "calls.raw"), "a") as f:
     f.write(json.dumps(sys.argv[1:]) + "\n")
-with open(os.path.join(d, "calls"), "a") as f:
-    f.write(json.dumps([x for x in sys.argv[1:] if x != "--"]) + "\n")
 state = json.load(open(os.path.join(d, "state.json")))
 a = [x for x in sys.argv[1:] if x != "--"]
 files = []
 while len(a) > 2 and a[1] == "-f":   # compose -f 파일 … 은 떼어 두고 본다
     files.append(a[2]); del a[1:3]
+with open(os.path.join(d, "calls"), "a") as f:   # calls 에는 -f 를 뗀 모양으로 남긴다(calls.raw 는 그대로)
+    f.write(json.dumps(a) + "\n")
+if a[0] == "compose" and files != ["docker-compose.yml", "compose.generated.yml"]:
+    sys.stderr.write("compose 는 언제나 -f 두 개로 불러야 한다\n"); sys.exit(3)
 if state.get("daemon") is False and a[0] != "compose":
     sys.stderr.write("failed to connect to the docker API\n"); sys.exit(1)
 if a[:2] == ["compose", "config"]:
-    if state.get("config_error") and files: sys.exit(1)
+    if state.get("config_error") and "--quiet" in a: sys.exit(1)
     cfg = state["compose"]
     for name in files[1:]:   # 생성 파일(JSON)의 서비스를 docker compose config 가 내는 모양으로 옮겨 합친다
         for key, svc in json.load(open(name))["services"].items():
@@ -267,7 +271,7 @@ class GuiTest(unittest.TestCase):
         self.save()
         status, body = self.post("/api/profiles/vpn-a/on")
         self.assertEqual(status, 409)
-        self.assertIn("docker compose build", body["message"])
+        self.assertIn("docker build -t vpn-proxy:local .", body["message"])
         self.assertNotIn("secret-path", json.dumps(body, ensure_ascii=False))
         self.state["action_error"] = "Bind for 127.0.0.1:1081 failed: port is already allocated"
         self.save()
@@ -557,8 +561,8 @@ class GuiTest(unittest.TestCase):
         self.post("/api/profiles/vpn-a/on")
         self.post("/api/profiles/vpn-a/off")
         raw = [json.loads(l) for l in (Path(self.tmp) / "calls.raw").read_text().splitlines()]
-        named = [c for c in raw if c[0] in ("inspect", "logs", "exec") or c[:2] in (["compose", "up"], ["compose", "stop"])]
-        self.assertEqual({c[0] if c[0] != "compose" else c[1] for c in named}, {"inspect", "logs", "exec", "up", "stop"})
+        named = [c for c in raw if c[0] in ("inspect", "logs", "exec") or (c[0] == "compose" and ("up" in c or "stop" in c))]
+        self.assertEqual({c[0] if c[0] != "compose" else c[5] for c in named}, {"inspect", "logs", "exec", "up", "stop"})
         for c in named:
             i = c.index("--")
             self.assertIn(c[i + 1], ("vpn-a", "vpn-proxy-a", "vpn-proxy-b", "vpn-proxy-c"), c)
@@ -645,7 +649,10 @@ class GuiTest(unittest.TestCase):
         self.assertNotIn(KEY_MARK, json.dumps(self.overview()))
         # 켜기·끄기는 생성 파일을 -f 로 함께 쓴다
         self.assertEqual(self.post("/api/profiles/office/on")[0], 200)
-        self.assertEqual(self.calls()[-1], ["compose", "-f", "docker-compose.yml", "-f", "compose.generated.yml", "up", "-d", "--no-build", "office"])
+        self.assertEqual(self.calls()[-1], ["compose", "up", "-d", "--no-build", "office"])
+        raw = [json.loads(l) for l in (Path(self.tmp) / "calls.raw").read_text().splitlines()]
+        self.assertEqual(raw[-1], ["compose", "-f", "docker-compose.yml", "-f", "compose.generated.yml", "up", "-d", "--no-build", "--", "office"])
+        self.assertTrue(all(c[1:5] == ["-f", "docker-compose.yml", "-f", "compose.generated.yml"] for c in raw if c[0] == "compose"))   # 언제나 두 파일
         # 다음 것은 다음 빈 포트
         self.assertIn("127.0.0.1:1085", self.upload("lab-2")[1]["message"])
 
@@ -690,8 +697,8 @@ class GuiTest(unittest.TestCase):
             self.assertTrue(any(why in r for r in data["reasons"]), (label, data["reasons"]))
             self.assertTrue(any("번째 줄" in r for r in data["reasons"]), label)   # 줄 번호
             self.assertFalse((Path(self.tmp) / "ovpn" / "office").exists(), label)   # 거절하면 남기지 않는다
-        self.assertFalse((Path(self.tmp) / "vpns.json").exists())
-        self.assertFalse((Path(self.tmp) / "compose.generated.yml").exists())
+        self.assertEqual(json.loads((Path(self.tmp) / "vpns.json").read_text()), {"vpns": []})
+        self.assertEqual(json.loads((Path(self.tmp) / "compose.generated.yml").read_text()), {"services": {}})
         # 바깥 파일을 가리키는 줄은 올릴 수 없다(올리는 것은 파일 하나뿐). 줄 번호를 알려 준다
         n = FAKE_OVPN.count("\n")
         for extra in ("ca ca.crt\n", "auth-user-pass creds.txt\n", "setenv opt tls-crypt tc.key\n", "<connection>\nremote h 1\nkey /etc/passwd\n</connection>\n"):
@@ -778,12 +785,13 @@ class GuiTest(unittest.TestCase):
         self.use_checker()
         self.state["config_error"] = True
         self.save()
-        # 기본 파일만 읽을 때는 되고, 생성 파일을 함께 읽으면 실패하는 상황
+        # 목록 조회는 되고, 등록 뒤의 확인(config --quiet)만 실패하는 상황
         status, data = self.upload()
         self.assertEqual((status, data["ok"]), (409, False))
         self.assertIn("되돌렸습니다", data["message"])
-        for left in ("ovpn/office", "vpns.json.tmp", "compose.generated.yml"):
+        for left in ("ovpn/office", "vpns.json.tmp", "compose.generated.yml.tmp"):
             self.assertFalse((Path(self.tmp) / left).exists(), left)
+        self.assertEqual(json.loads((Path(self.tmp) / "compose.generated.yml").read_text()), {"services": {}})
         self.assertEqual(json.loads((Path(self.tmp) / "vpns.json").read_text()), {"vpns": []})
 
     def test_delete_needs_confirmation_and_only_removes_uploaded_vpns(self):
@@ -801,7 +809,7 @@ class GuiTest(unittest.TestCase):
         for name in ("vpn-a", "nope"):
             status, data = self.send(f"/api/vpns/{name}/delete", {"confirm": name})
             self.assertEqual(status, 409, name)
-            self.assertIn("웹에서 올린 VPN 만", data["message"])
+            self.assertIn("등록된 VPN 만", data["message"])
         for path in ("/api/vpns/../delete", "/api/vpns/A/delete", "/api/vpns/a%2Fb/delete", "/api/vpns/office/delete?confirm=office"):
             self.assertIn(self.send(path, {"confirm": "office"})[0], (400, 404), path)
         self.assertTrue((Path(self.tmp) / "ovpn" / "vpn-a" / "client.ovpn").exists())
@@ -816,13 +824,13 @@ class GuiTest(unittest.TestCase):
         # 확인하면: 컨테이너 정지·삭제 → 등록부에서 빼기 → 폴더 삭제
         status, data = self.send("/api/vpns/office/delete", {"confirm": "office"})
         self.assertEqual((status, data), (200, {"ok": True, "message": "지웠습니다."}))
-        self.assertEqual(self.calls()[-2], ["compose", "-f", "docker-compose.yml", "-f", "compose.generated.yml", "rm", "--stop", "--force", "office"])
+        self.assertEqual(self.calls()[-2], ["compose", "rm", "--stop", "--force", "office"])
         self.assertFalse(folder.exists())
         self.assertEqual([e["name"] for e in json.loads((Path(self.tmp) / "vpns.json").read_text())["vpns"]], ["keep"])
         self.assertEqual(sorted(self.by_id(self.overview())), ["keep", "vpn-a", "vpn-b", "vpn-c"])
-        # 마지막 것을 지우면 생성 파일도 없어지고, 기본 compose 만 쓴다
+        # 마지막 것을 지워도 생성 파일은 (빈 채로) 남는다 — compose 는 언제나 두 파일로 부른다
         self.assertEqual(self.send("/api/vpns/keep/delete", {"confirm": "keep"})[0], 200)
-        self.assertFalse((Path(self.tmp) / "compose.generated.yml").exists())
+        self.assertEqual(json.loads((Path(self.tmp) / "compose.generated.yml").read_text()), {"services": {}})
         self.assertEqual(self.post("/api/profiles/vpn-a/on")[0], 200)
         self.assertEqual(self.calls()[-1], ["compose", "up", "-d", "--no-build", "vpn-a"])
         self.assertTrue((Path(self.tmp) / "ovpn" / "vpn-a" / "auth.txt").exists())   # 다른 VPN 의 파일은 그대로
@@ -844,14 +852,17 @@ class GuiTest(unittest.TestCase):
         bad = {"vpns": [{"name": "../../etc", "port": 1084}, {"name": "ok", "port": 80}, {"name": "ok2", "port": "1084"},
                         {"name": "ok3", "port": True}, {"name": "fine", "port": 1090, "folder": "/etc"}, "x", {"name": "fine", "port": 1091}]}
         (Path(self.tmp) / "vpns.json").write_text(json.dumps(bad))
-        self.assertEqual(self.manager.store.entries(), [{"name": "fine", "port": 1090}])
+        self.assertEqual(self.manager.store.entries(), [{"name": "fine", "port": 1090, "dns": [], "imported": False}])
+        dup = {"vpns": [{"name": "a1", "port": 1090}, {"name": "a2", "port": 1090}, {"name": "a3", "port": 70000}, {"name": "a4", "port": 1091, "dns": ["127.0.0.1"], "imported": "yes"}]}
+        (Path(self.tmp) / "vpns.json").write_text(json.dumps(dup))
+        self.assertEqual(self.manager.store.entries(), [{"name": "a1", "port": 1090, "dns": [], "imported": False}, {"name": "a4", "port": 1091, "dns": [], "imported": False}])
         self.assertEqual(self.manager.store.service({"name": "fine", "port": 1090})["volumes"], ["./ovpn/fine:/vpn:ro"])   # 폴더는 이름에서만 만든다
         for junk in ("{", "[]", '{"vpns": 3}'):
             (Path(self.tmp) / "vpns.json").write_text(junk)
             self.assertEqual(self.manager.store.entries(), [])
 
     def test_generated_service_matches_the_compose_template(self):
-        """생성 서비스의 권한·격리 값이 docker-compose.yml 의 x-vpn 블록과 같다(진짜 docker compose config 로 비교)."""
+        """생성 서비스의 권한·격리 값이 docker-compose.yml 의 vpn-template 과 같다(진짜 docker compose config 로 비교)."""
         docker = shutil.which("docker") or "/Users/%s/.docker/bin/docker" % os.environ.get("USER", "")
         if not os.path.exists(docker) or gui.Docker(binary=docker, cwd=self.tmp).run(["compose", "version"])[0] != 0:
             self.skipTest("docker compose 가 없다")
@@ -859,17 +870,148 @@ class GuiTest(unittest.TestCase):
         work.mkdir()
         shutil.copy(REPO / "docker-compose.yml", work / "docker-compose.yml")
         store = gui.vpnstore.Store(work)
-        store.save([{"name": "office", "port": 1084}])
-        rc, out, err = gui.Docker(binary=docker, cwd=work).run(["compose", *store.compose_files(), "config", "--format", "json"])
+        run = gui.Docker(binary=docker, cwd=work).run
+        # VPN 0개: 생성 파일은 비어 있고, 저절로 뜨는 서비스가 없다
+        rc, out, err = run(["compose", *store.compose_files(), "config", "--format", "json"])
+        self.assertEqual((rc, json.loads(out).get("services", {})), (0, {}), err)
+        store.save([{"name": "office", "port": 1084, "dns": ["10.0.0.2", "10.0.0.3"]}])
+        rc, out, err = run(["compose", *store.compose_files(), "--profile", "template", "config", "--format", "json"])
         self.assertEqual(rc, 0, err)
         svcs = json.loads(out)["services"]
-        mine, base = svcs["office"], svcs["vpn-a"]
-        differ = {"container_name", "environment", "ports", "volumes"}
+        self.assertEqual(sorted(svcs), ["office", "vpn-template"])
+        mine, base = svcs["office"], svcs["vpn-template"]
+        differ = {"container_name", "environment", "ports", "volumes", "profiles"}
         self.assertEqual({k: v for k, v in mine.items() if k not in differ}, {k: v for k, v in base.items() if k not in differ})
-        self.assertEqual(mine["ports"], [{**base["ports"][0], "published": "1084"}])
-        self.assertEqual(mine["ports"][0]["host_ip"], "127.0.0.1")
+        self.assertEqual((base.get("ports"), base.get("volumes"), base["profiles"]), (None, None, ["template"]))
+        self.assertEqual(mine["environment"]["VPN_DNS"], "10.0.0.2,10.0.0.3")
+        self.assertEqual(mine["ports"], [{"mode": "ingress", "host_ip": "127.0.0.1", "target": 1080, "published": "1084", "protocol": "tcp"}])
+        rc, out, _ = run(["compose", *store.compose_files(), "config", "--services"])
+        self.assertEqual((rc, out.split()), (0, ["office"]))   # 틀은 저절로 뜨지 않는다
         self.assertEqual((mine["volumes"][0]["target"], mine["volumes"][0].get("read_only")), ("/vpn", True))
         self.assertEqual(mine["volumes"][0]["source"], str((work / "ovpn" / "office").resolve()))
+
+    # ── 기존 폴더 가져오기·포트 지정·교체 ─────────────────────────────────
+    def folder(self, name, files=None, mode=0o755):
+        d = Path(self.tmp) / "ovpn" / name
+        d.mkdir(parents=True, exist_ok=True)
+        for fname, text in (files or {"corp one.ovpn": FAKE_OVPN}).items():
+            (d / fname).write_text(text)
+            os.chmod(d / fname, 0o644)
+        os.chmod(d, mode)
+        return d
+
+    def ctl(self, *argv):
+        out = io.StringIO()
+        rc = vpnctl.main(list(argv), root=Path(self.tmp), out=out)
+        return rc, out.getvalue()
+
+    def test_import_existing_folders_with_chosen_ports(self):
+        """예전 방식의 폴더 3개를 포트 그대로 등록한다(마이그레이션)."""
+        self.use_checker()
+        self.state["compose"] = {"services": {}}   # 고정 슬롯이 없는 새 구조
+        self.save()
+        self.assertEqual(self.overview()["profiles"], [])
+        (Path(self.tmp) / "ovpn" / "vpn-a" / "client.ovpn").unlink()   # setUp 이 넣어 둔 것
+        self.folder("vpn-a", {"corp one.ovpn": FAKE_OVPN, "auth.txt": "u\n" + PW_MARK + "\n", ".gitkeep": ""})
+        self.folder("vpn-b", {"b.ovpn": FAKE_OVPN.replace("</ca>", "</ca>\nca ca.crt"), "ca.crt": "x"})   # 인증서가 따로인 ovpn 도 된다
+        self.folder("vpn-c")
+        self.manager.store.port_free = lambda port: False   # 예전 컨테이너가 포트를 쥐고 있어도 지정한 포트는 받는다
+        for name, port in (("vpn-a", 1081), ("vpn-b", 1082), ("vpn-c", 1083)):
+            rc, out = self.ctl("import", name, "--port", str(port))
+            self.assertEqual(rc, 0, out)
+            self.assertIn(f"127.0.0.1:{port}", out)
+            self.assertNotIn(PW_MARK, out)
+        self.assertEqual((self.mode("ovpn", "vpn-a"), self.mode("ovpn", "vpn-a", "corp one.ovpn"), self.mode("ovpn", "vpn-a", "auth.txt")), (0o700, 0o600, 0o600))
+        reg = json.loads((Path(self.tmp) / "vpns.json").read_text())["vpns"]
+        self.assertEqual(reg[0], {"name": "vpn-a", "port": 1081, "folder": "ovpn/vpn-a", "imported": True})
+        gen = json.loads((Path(self.tmp) / "compose.generated.yml").read_text())["services"]
+        self.assertEqual({k: v["ports"] for k, v in gen.items()}, {"vpn-a": ["127.0.0.1:1081:1080"], "vpn-b": ["127.0.0.1:1082:1080"], "vpn-c": ["127.0.0.1:1083:1080"]})
+        self.assertEqual(gen["vpn-a"]["volumes"], ["./ovpn/vpn-a:/vpn:ro"])
+        self.manager._cache = None
+        self.manager.forget_overview()
+        view = self.by_id(self.overview())
+        self.assertEqual({k: (v["socks_port"], v["managed"], v["imported"]) for k, v in view.items()},
+                         {"vpn-a": (1081, True, True), "vpn-b": (1082, True, True), "vpn-c": (1083, True, True)})
+        self.assertEqual(view["vpn-a"]["title"], "corp one")
+        self.assertEqual(self.ctl("list")[1].count("(가져온 폴더)"), 3)
+        # 웹에서 올리는 것은 그다음 빈 포트를 받는다
+        self.manager.store.port_free = lambda port: True
+        self.assertIn("127.0.0.1:1084", self.upload()[1]["message"])
+        # 가져온 것을 화면에서 지우면 등록만 지우고 폴더는 남긴다. 화면에서 교체하지 않는다
+        status, data = self.upload("vpn-a", replace=True)
+        self.assertEqual(status, 409)
+        self.assertIn("직접 넣은 폴더", data["message"])
+        status, data = self.send("/api/vpns/vpn-a/delete", {"confirm": "vpn-a"})
+        self.assertEqual(status, 200)
+        self.assertIn("그대로 두었습니다", data["message"])
+        self.assertTrue((Path(self.tmp) / "ovpn" / "vpn-a" / "corp one.ovpn").exists())
+        self.assertNotIn("vpn-a", json.loads((Path(self.tmp) / "compose.generated.yml").read_text())["services"])
+
+    def test_import_refuses_bad_folders_ports_and_dns(self):
+        self.use_checker()
+        self.folder("good")
+        self.folder("two", {"a.ovpn": FAKE_OVPN, "b.ovpn": FAKE_OVPN})
+        self.folder("none", {"readme.txt": "x"})
+        self.folder("badcfg", {"x.ovpn": FAKE_OVPN + "up /bin/sh\n"})
+        os.symlink(Path(self.tmp) / "ovpn" / "good", Path(self.tmp) / "ovpn" / "link")
+        for argv, why in ((("import", "missing"), "폴더가 없습니다"), (("import", "link"), "폴더가 없습니다"), (("import", "two"), "2개"),
+                          (("import", "none"), "0개"), (("import", "../good"), "이름은"), (("import", "Good"), "이름은"),
+                          (("import", "good", "--port", "80"), "포트는"), (("import", "good", "--port", "70000"), "포트는"),
+                          (("import", "good", "--dns", "127.0.0.1"), "DNS 는"), (("import", "good", "--dns", "10.0.0.2;id"), "DNS 는"),
+                          (("import", "good", "--dns", "1.1.1.1,2.2.2.2,3.3.3.3,4.4.4.4,5.5.5.5"), "DNS 는")):
+            rc, out = self.ctl(*argv)
+            self.assertEqual(rc, 1, argv)
+            self.assertIn(why, out, argv)
+        rc, out = self.ctl("import", "badcfg")
+        self.assertEqual(rc, 1)
+        self.assertIn("받지 않는 지시 \"up\"", out)
+        self.assertEqual(self.mode("ovpn", "badcfg"), 0o755)   # 거절한 폴더는 건드리지 않는다
+        self.assertEqual(self.manager.store.entries(), [])
+        self.assertEqual(self.ctl("import", "good", "--port", "1081", "--dns", "10.0.0.2,10.0.0.3")[0], 0)
+        self.assertEqual(self.manager.store.service(self.manager.store.entries()[0])["environment"]["VPN_DNS"], "10.0.0.2,10.0.0.3")
+        self.folder("other")
+        for argv, why in ((("import", "good"), "이미 등록된"), (("import", "other", "--port", "1081"), "다른 VPN 이 쓰는 포트"),
+                          (("set", "nope", "--port", "1090"), "등록되지 않은"), (("forget", "nope"), "등록되지 않은")):
+            rc, out = self.ctl(*argv)
+            self.assertEqual((rc, why in out), (1, True), (argv, out))
+        # 포트·DNS 바꾸기, 등록만 지우기
+        self.assertEqual(self.ctl("import", "other")[0], 0)   # 포트를 안 적으면 빈 번호
+        self.assertEqual(self.ctl("set", "other", "--port", "1081")[0], 1)
+        self.assertEqual(self.ctl("set", "other", "--port", "2081", "--dns", "10.9.9.9")[0], 0)
+        self.assertEqual(self.ctl("set", "good", "--dns", "")[0], 0)
+        by = {e["name"]: e for e in self.manager.store.entries()}
+        self.assertEqual((by["other"]["port"], by["other"]["dns"], by["good"]["dns"], by["good"]["port"]), (2081, ["10.9.9.9"], [], 1081))
+        self.assertEqual(self.ctl("forget", "other")[0], 0)
+        self.assertTrue((Path(self.tmp) / "ovpn" / "other").is_dir())
+        self.assertEqual([e["name"] for e in self.manager.store.entries()], ["good"])
+
+    def test_replace_an_uploaded_ovpn(self):
+        self.use_checker()
+        self.assertEqual(self.upload(ovpn=FAKE_OVPN + "auth-user-pass\n", username="u", password=PW_MARK)[0], 200)
+        folder = Path(self.tmp) / "ovpn" / "office"
+        # 같은 이름을 그냥 다시 올리면 거절, replace 가 참일 때만 바꾼다
+        self.assertEqual(self.upload()[0], 409)
+        for bad in ("yes", 1, None):
+            self.assertEqual(self.upload(replace=bad)[0], 409, bad)
+        # 새 것이 검사를 통과하지 못하면 기존 것을 그대로 둔다
+        status, data = self.upload(ovpn=FAKE_OVPN + "up /bin/sh\n", replace=True)
+        self.assertEqual(status, 409)
+        self.assertIn("기존 것은 그대로", data["message"])
+        self.assertEqual((folder / "office.ovpn").read_text(), FAKE_OVPN + "auth-user-pass\n")
+        self.assertTrue((folder / "auth.txt").exists())
+        self.assertEqual(sorted(p.name for p in folder.iterdir()), ["auth.txt", "office.ovpn"])
+        # 통과하면 바꾼다. 포트는 그대로, 필요 없어진 아이디·비밀번호 파일은 지운다
+        new = FAKE_OVPN.replace("vpn.example.invalid", "vpn2.example.invalid")
+        status, data = self.upload(ovpn=new, replace=True)
+        self.assertEqual((status, data["ok"]), (200, True))
+        self.assertIn("포트 1084 그대로", data["message"])
+        self.assertNotIn(KEY_MARK, json.dumps(data))
+        self.assertEqual((folder / "office.ovpn").read_text(), new)
+        self.assertEqual((sorted(p.name for p in folder.iterdir()), self.mode("ovpn", "office", "office.ovpn")), (["office.ovpn"], 0o600))
+        self.assertEqual(json.loads((Path(self.tmp) / "vpns.json").read_text())["vpns"], [{"name": "office", "port": 1084, "folder": "ovpn/office"}])
+        self.assertEqual(self.by_id(self.overview())["office"]["server"], "vpn2.example.invalid:1194/udp")
+        # replace 를 켰어도 없는 이름이면 새로 등록한다
+        self.assertIn("등록했습니다", self.upload("fresh", replace=True)[1]["message"])
 
     def test_repo_files(self):
         self.assertIn("!rootfs/", (REPO / ".dockerignore").read_text())  # 화면 코드는 이미지에 들어가지 않는다
@@ -885,6 +1027,12 @@ class GuiTest(unittest.TestCase):
         for bad in ("shell=True", "os.system", "read_bytes", "print("):
             self.assertNotIn(bad, store)
         self.assertEqual(store.count("read_text"), 1)
+        ctl = (REPO / "gui" / "vpnctl.py").read_text()
+        for bad in ("shell=True", "os.system", "read_text", "read_bytes", "open("):
+            self.assertNotIn(bad, ctl)   # 명령줄 도구는 파일 내용을 읽어 찍지 않는다
+        base = (REPO / "docker-compose.yml").read_text()
+        self.assertNotRegex(base, r"(?m)^  vpn-[abc]:")   # 고정 슬롯이 없다
+        self.assertNotIn("VPN_A_", base + (REPO / ".env.example").read_text())
         self.assertEqual(len(re.findall(r"(?<![.\w])open\(", store)), 0)   # 파일은 os.open 으로만 연다
         self.assertEqual((store.count("os.open("), store.count("os.O_WRONLY")), (2, 2))   # 둘 다 쓰기 전용
         self.assertNotIn("$\")", store)   # 이름·비밀번호 검사는 fullmatch 로 한다

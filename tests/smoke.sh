@@ -1,5 +1,5 @@
 #!/bin/sh
-# 실제 VPN 없이 확인할 수 있는 것만 확인한다. 먼저 `docker compose build` 를 해 둔다.
+# 실제 VPN 없이 확인할 수 있는 것만 확인한다. 먼저 `docker build -t vpn-proxy:local .` 을 해 둔다.
 #   1) compose 설정이 맞고 포트가 127.0.0.1 에만 묶이는지, 베이스 이미지가 고정됐는지
 #   2) ovpn 이 없거나 비밀번호 파일이 없으면 명확한 오류로 멈추는지
 #   3) ovpn 검사: 허용 목록 밖의 지시·글자·블록을 거부하는지(보안 검토의 우회 시도 포함),
@@ -52,10 +52,13 @@ wait_state() { # 상태 단어, 최대 초
 }
 
 echo "1) compose 설정"
-if $DOCKER compose config -q; then ok "compose config"; else bad "compose config"; fi
-binds=$($DOCKER compose config --format json | grep -o '"host_ip": *"[^"]*"' | sort -u)
-if [ "$binds" = '"host_ip": "127.0.0.1"' ]; then ok "모든 포트가 127.0.0.1 에만 묶임"; else bad "127.0.0.1 이 아닌 바인드: $binds"; fi
-if $DOCKER compose config | grep -q NET_RAW; then bad "compose 에 NET_RAW 가 있음"; else ok "compose 에 NET_RAW 없음"; fi
+# VPN 서비스는 등록부에서 생긴다(compose.generated.yml). 여기서는 모든 서비스가 따르는 틀(vpn-template)을 본다.
+# 생성된 서비스가 틀과 같고 포트가 127.0.0.1 에만 묶이는지는 tests/gui_test.py 가 확인한다.
+tpl() { $DOCKER compose -f docker-compose.yml --profile template config "$@"; }
+if tpl -q; then ok "compose config"; else bad "compose config"; fi
+if [ "$($DOCKER compose -f docker-compose.yml config --services | wc -l | tr -d ' ')" = "0" ]; then ok "기본 compose 에 저절로 뜨는 서비스 없음"; else bad "기본 compose 에 고정 서비스가 있음"; fi
+if tpl --format json | grep -q '"published"'; then bad "틀에 포트가 열려 있음"; else ok "틀에 열린 포트 없음(포트는 등록할 때 127.0.0.1 로만 붙는다)"; fi
+if tpl | grep -q NET_RAW; then bad "compose 에 NET_RAW 가 있음"; else ok "compose 에 NET_RAW 없음"; fi
 if grep -Eq '^FROM alpine:[0-9]+\.[0-9]+\.[0-9]+@sha256:[0-9a-f]{64}$' Dockerfile; then ok "베이스 이미지가 정확한 버전과 다이제스트로 고정됨"; else bad "베이스 이미지가 고정되지 않음"; fi
 
 echo "2) 설정 파일 오류"

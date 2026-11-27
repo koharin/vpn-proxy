@@ -5,9 +5,10 @@
   VPN_GUI_PORT=8031 python3 gui/server.py
 
 하는 일
-  - compose 에 정의된 VPN(프로필) 목록, 상태, SOCKS5 포트, 최근 로그를 보여 준다.
+  - 등록된 VPN(프로필) 목록, 상태, SOCKS5 포트, 최근 로그를 보여 준다.
   - .ovpn 파일을 올리면 새 VPN 으로 등록한다(이름·포트·폴더는 vpns.json, 서비스는 compose.generated.yml).
-    올린 VPN 은 화면에서 지울 수 있다. docker-compose.yml 에 적힌 VPN 은 지우지 않는다.
+    같은 이름으로 다시 올려 교체할 수 있고, 화면에서 지울 수 있다. 고정된 VPN 은 없다 — 처음에는 0개다.
+  - docker compose 는 언제나 -f docker-compose.yml -f compose.generated.yml 로 부른다.
   - 프로필 제목은 그 폴더의 .ovpn 파일 이름, 부제는 그 ovpn 이 접속하는 서버(remote 호스트:포트/프로토콜)다.
   - 켜기 = docker compose up -d --no-build <서비스>,  끄기 = docker compose stop <서비스>.
 
@@ -219,7 +220,7 @@ class Manager:
         except ValueError:
             return None, "compose 설정을 해석하지 못했습니다."
         result = []
-        managed = self.store.names()
+        managed = {e["name"]: e for e in self.store.entries()}
         for key in sorted(services):
             svc = services[key] or {}
             if not NAME_RE.match(key):
@@ -245,15 +246,19 @@ class Manager:
                     "socks_port": int(port) if port and port.isdigit() else None,
                     "socks_host": host_ip,
                     "folder": folder,
-                    "managed": key in managed,  # 웹에서 올린 것(지울 수 있다)
+                    "managed": key in managed,  # 등록부에 있는 것(지울 수 있다)
+                    "imported": bool(managed.get(key, {}).get("imported")),  # 직접 넣은 폴더(지워도 폴더는 남긴다)
                 }
             )
         self._cache, self._cache_at = result, now
         return result, None
 
     def _compose(self):
-        """compose 명령의 앞부분. 올린 VPN 이 있으면 생성 파일을 -f 로 함께 쓴다."""
-        return ["compose", *self.store.compose_files()]
+        """compose 명령의 앞부분. 언제나 기본 파일과 생성 파일을 -f 로 함께 쓴다."""
+        try:
+            return ["compose", *self.store.compose_files()]
+        except OSError:  # 생성 파일을 만들지 못했다 → docker 가 '파일 없음'으로 실패하고 화면에 사유가 뜬다
+            return ["compose", "-f", vpnstore.BASE_COMPOSE, "-f", vpnstore.GENERATED]
 
     def profile(self, profile_id):
         if not isinstance(profile_id, str) or not NAME_RE.match(profile_id):
@@ -292,6 +297,7 @@ class Manager:
             "socks_port": profile["socks_port"],
             "socks_host": profile["socks_host"],
             "managed": bool(profile.get("managed")),
+            "imported": bool(profile.get("imported")),
             "folder": self._folder_label(profile["folder"]),
             "ovpn_files": len(names) if names is not None else None,
             "state": OFF,
@@ -425,9 +431,9 @@ class Manager:
         if "cannot connect" in low or "failed to connect" in low or "daemon" in low:
             return False, "Docker 가 꺼져 있습니다."
         if on and ("no such image" in low or "pull access denied" in low or "not found" in low):
-            return False, "이미지가 없습니다. 먼저 터미널에서 docker compose build 를 실행하세요."
+            return False, "이미지가 없습니다. 먼저 터미널에서 docker build -t vpn-proxy:local . 을 실행하세요."
         if "port is already allocated" in low or "address already in use" in low:
-            return False, "SOCKS5 포트를 다른 프로그램이 쓰고 있습니다. .env 의 포트를 바꾸세요."
+            return False, "SOCKS5 포트를 다른 프로그램이 쓰고 있습니다. python3 gui/vpnctl.py set <이름> --port <번호> 로 바꾸세요."
         return False, "docker 명령이 실패했습니다. 터미널에서 docker compose logs 로 확인하세요."
 
     # ── 올리기·삭제 ────────────────────────────────────────────────────────
@@ -436,8 +442,13 @@ class Manager:
         self.forget_overview()
 
     def add_vpn(self, body):
-        """올린 ovpn 을 새 VPN 으로 등록한다. (성공 여부, 한 줄, 사유 줄들). 올린 내용은 돌려주지 않는다."""
+        """올린 ovpn 을 새 VPN 으로 등록한다(replace 가 참이고 같은 이름이 등록돼 있으면 그 ovpn 을 바꾼다).
+
+        (성공 여부, 한 줄, 사유 줄들). 올린 내용은 돌려주지 않는다.
+        """
         if not isinstance(body, dict) or any(not isinstance(body.get(k, ""), str) for k in ("name", "ovpn", "username", "password")):
+            return False, "잘못된 요청입니다.", []
+        if not isinstance(body.get("replace", False), bool):
             return False, "잘못된 요청입니다.", []
         if not self._lock.acquire(blocking=False):
             return False, "다른 작업이 진행 중입니다. 잠시 뒤 다시 하세요.", []
@@ -445,9 +456,15 @@ class Manager:
             items, error = self.profiles(max_age=0)
             if items is None:
                 return False, error, []
+            name = body.get("name", "")
+            replacing = body.get("replace") is True and name in self.store.names()
             try:
+                if replacing:
+                    made = self.store.replace(name, body.get("ovpn", ""), body.get("username", ""), body.get("password", ""), clean=redact_line)
+                    note = " 아이디·비밀번호를 저장했습니다." if made["auth"] else ""
+                    return True, f"{made['name']} 의 ovpn 을 바꿨습니다(포트 {made['port']} 그대로).{note} 켜져 있으면 껐다 켜야 적용됩니다.", []
                 made = self.store.add(
-                    body.get("name", ""), body.get("ovpn", ""), body.get("username", ""), body.get("password", ""),
+                    name, body.get("ovpn", ""), body.get("username", ""), body.get("password", ""),
                     taken_ids={p["id"] for p in items}, taken_containers={p["container"] for p in items},
                     taken_ports={p["socks_port"] for p in items if p["socks_port"]}, clean=redact_line,
                 )
@@ -470,9 +487,13 @@ class Manager:
             self._forget_all()
 
     def delete_vpn(self, name, confirm):
-        """올린 VPN 을 지운다: 컨테이너 정지·삭제 → 등록부에서 빼기 → 폴더 삭제. confirm 은 이름과 같아야 한다."""
-        if not isinstance(name, str) or name not in self.store.names():
-            return False, "웹에서 올린 VPN 만 지울 수 있습니다."
+        """등록된 VPN 을 지운다: 컨테이너 정지·삭제 → 등록부에서 빼기 → 폴더 삭제(가져온 폴더는 남긴다).
+
+        confirm 은 이름과 같아야 한다.
+        """
+        entry = next((e for e in self.store.entries() if e["name"] == name), None) if isinstance(name, str) else None
+        if entry is None:
+            return False, "등록된 VPN 만 지울 수 있습니다."
         if confirm != name:
             return False, "삭제 확인이 필요합니다."
         if not self._lock.acquire(blocking=False):
@@ -485,6 +506,8 @@ class Manager:
                 gone = self.store.remove(name)
             except (vpnstore.Rejected, OSError):
                 return False, "등록을 지우지 못했습니다."
+            if entry["imported"]:
+                return True, f"등록을 지웠습니다. 직접 넣은 폴더 ovpn/{name} 는 그대로 두었습니다."
             return True, "지웠습니다." if gone else "등록은 지웠지만 폴더가 남았습니다. ovpn/ 아래를 직접 확인하세요."
         finally:
             self._lock.release()
