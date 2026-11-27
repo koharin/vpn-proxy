@@ -6,6 +6,8 @@
 
 하는 일
   - compose 에 정의된 VPN(프로필) 목록, 상태, SOCKS5 포트, 최근 로그를 보여 준다.
+  - .ovpn 파일을 올리면 새 VPN 으로 등록한다(이름·포트·폴더는 vpns.json, 서비스는 compose.generated.yml).
+    올린 VPN 은 화면에서 지울 수 있다. docker-compose.yml 에 적힌 VPN 은 지우지 않는다.
   - 프로필 제목은 그 폴더의 .ovpn 파일 이름, 부제는 그 ovpn 이 접속하는 서버(remote 호스트:포트/프로토콜)다.
   - 켜기 = docker compose up -d --no-build <서비스>,  끄기 = docker compose stop <서비스>.
 
@@ -14,8 +16,9 @@
   - Host 머리말이 127.0.0.1/localhost 가 아니면 거절한다(다른 이름으로 이 주소를 가리키게 하는 공격 방지).
   - 상태를 바꾸는 요청은 POST 뿐이고, Origin 이 이 화면 자신일 때만 받는다. GET 은 아무것도 바꾸지 않는다.
   - 다룰 수 있는 대상은 compose 에 정의된 서비스 이름뿐이다. 요청 값은 그 목록과 비교만 한다.
-  - ovpn 을 올리거나 고치는 기능은 없다. ovpn 검사(check-ovpn.sh)는 컨테이너가 시작할 때 그대로 돈다.
-  - ovpn 에서는 파일 이름과 remote·port·proto 줄만 읽는다. 인증서·키 블록과 그 밖의 줄, auth.txt 는
+  - 올린 ovpn 은 저장한 뒤 check-ovpn.sh(컨테이너가 시작할 때 도는 그 검사)로 검사하고, 통과한 것만 등록한다.
+    저장·검사·삭제는 gui/vpnstore.py 가 한다. 올린 내용과 비밀번호는 응답·로그에 다시 내보내지 않는다.
+  - ovpn 에서는 파일 이름과 remote·port·proto 줄만 읽는다. 인증서·키 블록과 그 밖의 줄, 아이디·비밀번호 파일은
     읽어 쓰지 않는다. 로그는 가려서 보여 준다.
   - 명령은 인자 목록으로만 실행한다(셸을 거치지 않는다).
 """
@@ -28,7 +31,9 @@ import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from urllib.parse import parse_qs, urlsplit
+from urllib.parse import urlsplit
+
+import vpnstore
 
 BIND_HOST = "127.0.0.1"  # 바꾸지 않는다
 DEFAULT_PORT = 8030
@@ -46,6 +51,7 @@ REQUEST_TIMEOUT = 10  # 연결 하나가 요청을 보내는 데 쓸 수 있는 
 LOG_LINES = 40
 LOG_LINE_MAX = 300
 MAX_BODY = 1024
+UPLOAD_MAX_BODY = 2 * vpnstore.OVPN_MAX  # ovpn 을 JSON 글자열로 받는다(줄바꿈·따옴표가 2바이트가 된다)
 CMD_TIMEOUT = 20
 ACTION_TIMEOUT = 90
 
@@ -191,6 +197,7 @@ class Manager:
     def __init__(self, docker=None, root=ROOT):
         self.docker = docker or Docker(cwd=root)
         self.root = Path(root)
+        self.store = vpnstore.Store(root)
         self._cache = None
         self._cache_at = 0.0
         self._lock = threading.Lock()  # 켜기·끄기는 한 번에 하나씩
@@ -204,7 +211,7 @@ class Manager:
         now = time.monotonic()
         if self._cache is not None and now - self._cache_at < max_age:
             return self._cache, None
-        rc, out, _ = self.docker.run(["compose", "config", "--format", "json"])
+        rc, out, _ = self.docker.run([*self._compose(), "config", "--format", "json"])
         if rc != 0:
             return None, "compose 설정을 읽지 못했습니다(docker compose config 실패). docker 가 설치돼 있는지, .env 값을 확인하세요."
         try:
@@ -212,6 +219,7 @@ class Manager:
         except ValueError:
             return None, "compose 설정을 해석하지 못했습니다."
         result = []
+        managed = self.store.names()
         for key in sorted(services):
             svc = services[key] or {}
             if not NAME_RE.match(key):
@@ -237,10 +245,15 @@ class Manager:
                     "socks_port": int(port) if port and port.isdigit() else None,
                     "socks_host": host_ip,
                     "folder": folder,
+                    "managed": key in managed,  # 웹에서 올린 것(지울 수 있다)
                 }
             )
         self._cache, self._cache_at = result, now
         return result, None
+
+    def _compose(self):
+        """compose 명령의 앞부분. 올린 VPN 이 있으면 생성 파일을 -f 로 함께 쓴다."""
+        return ["compose", *self.store.compose_files()]
 
     def profile(self, profile_id):
         if not isinstance(profile_id, str) or not NAME_RE.match(profile_id):
@@ -278,6 +291,7 @@ class Manager:
             "server_more": more,
             "socks_port": profile["socks_port"],
             "socks_host": profile["socks_host"],
+            "managed": bool(profile.get("managed")),
             "folder": self._folder_label(profile["folder"]),
             "ovpn_files": len(names) if names is not None else None,
             "state": OFF,
@@ -398,9 +412,9 @@ class Manager:
             return False, "다른 켜기·끄기가 진행 중입니다. 잠시 뒤 다시 하세요."
         try:
             if on:
-                args = ["compose", "up", "-d", "--no-build", "--", profile["id"]]
+                args = [*self._compose(), "up", "-d", "--no-build", "--", profile["id"]]
             else:
-                args = ["compose", "stop", "--", profile["id"]]
+                args = [*self._compose(), "stop", "--", profile["id"]]
             rc, _, err = self.docker.run(args, timeout=ACTION_TIMEOUT)
         finally:
             self._lock.release()
@@ -415,6 +429,66 @@ class Manager:
         if "port is already allocated" in low or "address already in use" in low:
             return False, "SOCKS5 포트를 다른 프로그램이 쓰고 있습니다. .env 의 포트를 바꾸세요."
         return False, "docker 명령이 실패했습니다. 터미널에서 docker compose logs 로 확인하세요."
+
+    # ── 올리기·삭제 ────────────────────────────────────────────────────────
+    def _forget_all(self):
+        self._cache = None
+        self.forget_overview()
+
+    def add_vpn(self, body):
+        """올린 ovpn 을 새 VPN 으로 등록한다. (성공 여부, 한 줄, 사유 줄들). 올린 내용은 돌려주지 않는다."""
+        if not isinstance(body, dict) or any(not isinstance(body.get(k, ""), str) for k in ("name", "ovpn", "username", "password")):
+            return False, "잘못된 요청입니다.", []
+        if not self._lock.acquire(blocking=False):
+            return False, "다른 작업이 진행 중입니다. 잠시 뒤 다시 하세요.", []
+        try:
+            items, error = self.profiles(max_age=0)
+            if items is None:
+                return False, error, []
+            try:
+                made = self.store.add(
+                    body.get("name", ""), body.get("ovpn", ""), body.get("username", ""), body.get("password", ""),
+                    taken_ids={p["id"] for p in items}, taken_containers={p["container"] for p in items},
+                    taken_ports={p["socks_port"] for p in items if p["socks_port"]}, clean=redact_line,
+                )
+            except vpnstore.Rejected as e:
+                return False, e.message, e.reasons
+            except OSError:
+                return False, "파일을 쓰지 못했습니다(폴더 권한을 확인하세요).", []
+            # 생성한 compose 를 docker 가 받아들이는지 확인한다. 아니면 되돌린다.
+            rc, _, _ = self.docker.run([*self._compose(), "config", "--quiet"])
+            if rc != 0:
+                try:
+                    self.store.remove(made["name"])
+                except (vpnstore.Rejected, OSError):
+                    pass
+                return False, "만든 compose 설정을 docker 가 받아들이지 않아 되돌렸습니다.", []
+            note = " 아이디·비밀번호를 저장했습니다." if made["auth"] else ""
+            return True, f"{made['name']} 을(를) 등록했습니다 — SOCKS5 127.0.0.1:{made['port']}.{note} 켜기를 누르면 연결합니다.", []
+        finally:
+            self._lock.release()
+            self._forget_all()
+
+    def delete_vpn(self, name, confirm):
+        """올린 VPN 을 지운다: 컨테이너 정지·삭제 → 등록부에서 빼기 → 폴더 삭제. confirm 은 이름과 같아야 한다."""
+        if not isinstance(name, str) or name not in self.store.names():
+            return False, "웹에서 올린 VPN 만 지울 수 있습니다."
+        if confirm != name:
+            return False, "삭제 확인이 필요합니다."
+        if not self._lock.acquire(blocking=False):
+            return False, "다른 작업이 진행 중입니다. 잠시 뒤 다시 하세요."
+        try:
+            rc, _, _ = self.docker.run([*self._compose(), "rm", "--stop", "--force", "--", name], timeout=ACTION_TIMEOUT)
+            if rc != 0:
+                return False, "컨테이너를 멈추고 지우지 못해 그대로 두었습니다. Docker 가 켜져 있는지 확인하세요."
+            try:
+                gone = self.store.remove(name)
+            except (vpnstore.Rejected, OSError):
+                return False, "등록을 지우지 못했습니다."
+            return True, "지웠습니다." if gone else "등록은 지웠지만 폴더가 남았습니다. ovpn/ 아래를 직접 확인하세요."
+        finally:
+            self._lock.release()
+            self._forget_all()
 
 
 SECURITY_HEADERS = {
@@ -490,18 +564,31 @@ def make_handler(manager, port):
             if parts.query:
                 return self._fail(400, "주소에 값을 붙일 수 없습니다.")
             m = re.match(r"^/api/profiles/([A-Za-z0-9][A-Za-z0-9._-]{0,31})/(on|off)$", parts.path)
-            if not m:
+            d = re.fullmatch(r"/api/vpns/([a-z0-9][a-z0-9-]{0,23})/delete", parts.path)
+            upload = parts.path == "/api/vpns"
+            if not (m or d or upload):
                 return self._fail(404, "없는 주소입니다.")
             try:
                 length = int(self.headers.get("Content-Length", "0"))
             except ValueError:
                 return self._fail(400, "잘못된 요청입니다.")
-            if length < 0 or length > MAX_BODY:
-                return self._fail(413, "요청이 너무 큽니다.")
-            if length:
-                self.rfile.read(length)  # 본문 값은 쓰지 않는다
-            ok, message = manager.switch(m.group(1), m.group(2) == "on")
-            self._send(200 if ok else 409, {"ok": ok, "message": message})
+            if length < 0 or length > (UPLOAD_MAX_BODY if upload else MAX_BODY):
+                return self._fail(413, "요청이 너무 큽니다." + (f" ovpn 은 {vpnstore.OVPN_MAX // 1024}KB 까지입니다." if upload else ""))
+            raw = self.rfile.read(length) if length else b""
+            if m:  # 본문 값은 쓰지 않는다
+                ok, message = manager.switch(m.group(1), m.group(2) == "on")
+                return self._send(200 if ok else 409, {"ok": ok, "message": message})
+            try:
+                body = json.loads(raw.decode("utf-8"))
+            except (ValueError, RecursionError):
+                return self._fail(400, "잘못된 요청입니다.")
+            if not isinstance(body, dict):
+                return self._fail(400, "잘못된 요청입니다.")
+            if d:
+                ok, message = manager.delete_vpn(d.group(1), body.get("confirm"))
+                return self._send(200 if ok else 409, {"ok": ok, "message": message})
+            ok, message, reasons = manager.add_vpn(body)
+            self._send(200 if ok else 409, {"ok": ok, "message": message, "reasons": reasons})
 
         def _not_allowed(self):
             self._fail(405, "지원하지 않는 방식입니다.")

@@ -1,7 +1,9 @@
 # VPN 하나 = 서비스 하나. Mac 에는 VPN 을 켜지 않고 로컬 포트로 VPN 을 고른다.
 #   127.0.0.1:1081 → vpn-a,  :1082 → vpn-b,  :1083 → vpn-c
 #
-# VPN 을 늘리려면 맨 아래 서비스 블록을 복사해 이름·폴더·포트만 바꾼다(README "VPN 추가").
+# VPN 을 늘리려면 웹 화면에서 .ovpn 을 올린다(README "웹에서 VPN 추가"). 올린 것은 이 파일이 아니라
+# compose.generated.yml 에 생긴다. 손으로 넣으려면 맨 아래 블록을 복사해 이름·폴더·포트만 바꾼다.
+# 아래 x-vpn 블록을 고치면 gui/vpnstore.py 의 SERVICE_BASE 도 같게 고친다(tests/gui_test.py 가 비교한다).
 
 x-vpn: &vpn
   build: .

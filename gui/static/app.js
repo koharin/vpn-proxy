@@ -9,6 +9,8 @@ const empty = document.getElementById("empty");
 const updated = document.getElementById("updated");
 const openLogs = new Set(); // 로그를 펼쳐 둔 VPN
 const busy = new Set(); // 켜기·끄기 요청이 진행 중인 VPN
+const asking = new Set(); // 삭제 확인을 묻고 있는 VPN
+const OVPN_MAX = 256 * 1024;
 let timer = null;
 
 function el(tag, cls, text) {
@@ -69,6 +71,30 @@ function card(p, dockerOk) {
   det.append(el("summary", "", "최근 로그 " + (p.log ? p.log.length : 0) + "줄"));
   det.append(el("pre", "", p.log && p.log.length ? p.log.join("\n") : "로그 없음"));
   box.append(det);
+
+  // 웹에서 올린 VPN 만 지울 수 있다. 한 번 더 묻고 지운다.
+  if (p.managed) {
+    const row = el("p", "row danger");
+    if (asking.has(p.id)) {
+      row.append(el("span", "", "컨테이너를 멈추고 ovpn 폴더(" + (p.folder || p.id) + ")를 지웁니다. 되돌릴 수 없습니다."));
+      const yes = el("button", "del", "삭제 확인");
+      yes.type = "button";
+      yes.disabled = !dockerOk || busy.has(p.id);
+      yes.addEventListener("click", () => remove(p));
+      const no = el("button", "off", "취소");
+      no.type = "button";
+      no.addEventListener("click", () => { asking.delete(p.id); refresh(); });
+      row.append(yes, no);
+    } else {
+      const del = el("button", "off", "삭제");
+      del.type = "button";
+      del.disabled = !dockerOk || busy.has(p.id);
+      del.setAttribute("aria-label", title + " 삭제");
+      del.addEventListener("click", () => { asking.add(p.id); refresh(); });
+      row.append(del);
+    }
+    box.append(row);
+  }
   return box;
 }
 
@@ -106,6 +132,77 @@ async function toggle(p, on) {
     await refresh();
   }
 }
+
+async function remove(p) {
+  if (busy.has(p.id)) return;
+  busy.add(p.id);
+  show(notice, (p.title || p.name) + " 지우는 중…");
+  try {
+    const res = await fetch("/api/vpns/" + encodeURIComponent(p.id) + "/delete", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ confirm: p.id }),
+    });
+    const data = await res.json();
+    show(notice, (p.title || p.name) + ": " + (data.message || (data.ok ? "지웠습니다." : "실패")));
+  } catch (e) {
+    show(notice, (p.title || p.name) + ": 요청을 보내지 못했습니다.");
+  } finally {
+    busy.delete(p.id);
+    asking.delete(p.id);
+    await refresh();
+  }
+}
+
+// ── VPN 추가 ────────────────────────────────────────────────────────────
+const addFile = document.getElementById("add-file");
+const addName = document.getElementById("add-name");
+const addUser = document.getElementById("add-user");
+const addPass = document.getElementById("add-pass");
+const addGo = document.getElementById("add-go");
+const addMsg = document.getElementById("add-msg");
+const addReasons = document.getElementById("add-reasons");
+
+function addResult(text, reasons) {
+  show(addMsg, text);
+  const items = Array.isArray(reasons) ? reasons : [];
+  addReasons.replaceChildren(...items.map((r) => el("li", "", String(r))));
+  addReasons.hidden = items.length === 0;
+}
+
+// 파일 이름에서 이름 칸을 채운다(소문자·숫자·- 만 남긴다).
+addFile.addEventListener("change", () => {
+  const f = addFile.files && addFile.files[0];
+  if (!f || addName.value) return;
+  addName.value = f.name.replace(/\.ovpn$/i, "").toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-+|-+$/g, "").slice(0, 24).replace(/-+$/, "");
+});
+
+async function upload() {
+  const f = addFile.files && addFile.files[0];
+  if (!f) return addResult("ovpn 파일을 고르세요.");
+  if (f.size > OVPN_MAX) return addResult("ovpn 파일이 너무 큽니다(256KB 까지).");
+  if (!/^[a-z0-9]([a-z0-9-]{0,22}[a-z0-9])?$/.test(addName.value)) return addResult("이름은 소문자·숫자·'-' 로 1~24자, 처음과 끝은 소문자나 숫자여야 합니다.");
+  addGo.disabled = true;
+  addResult("올리는 중…");
+  try {
+    const text = await f.text();
+    const res = await fetch("/api/vpns", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ name: addName.value, ovpn: text, username: addUser.value, password: addPass.value }),
+    });
+    const data = await res.json();
+    addResult(data.message || (data.ok ? "등록했습니다." : "실패"), data.reasons);
+    if (data.ok) { addFile.value = ""; addName.value = ""; addUser.value = ""; }
+  } catch (e) {
+    addResult("요청을 보내지 못했습니다.");
+  } finally {
+    addPass.value = ""; // 비밀번호는 화면에 남기지 않는다
+    addGo.disabled = false;
+    await refresh();
+  }
+}
+addGo.addEventListener("click", upload);
 
 function schedule() {
   clearInterval(timer);

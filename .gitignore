@@ -10,3 +10,7 @@ ovpn/**
 *.p12
 auth.txt
 .DS_Store
+# 웹 화면에서 올린 VPN 의 등록부와 거기서 만든 compose
+vpns.json
+compose.generated.yml
+*.tmp

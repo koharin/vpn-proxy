@@ -77,7 +77,7 @@ curl --socks5-hostname 127.0.0.1:1081 http://10.0.0.10/    # vpn-a 안의 서버
 
 ## 웹 화면
 
-켜고 끄기와 상태 확인을 브라우저에서 한다. Mac 에서 도는 작은 서버가 이 폴더의 `docker compose` 를 대신 부른다.
+VPN 추가(.ovpn 올리기), 켜고 끄기, 상태 확인, 삭제를 브라우저에서 한다. Mac 에서 도는 작은 서버가 이 폴더의 `docker compose` 를 대신 부른다.
 필요한 것은 Mac 에 이미 있는 `python3` 뿐이다(설치할 것 없음).
 
 ```sh
@@ -86,7 +86,7 @@ python3 gui/server.py                # http://127.0.0.1:8030   끝내기: Ctrl+C
 VPN_GUI_PORT=8031 python3 gui/server.py
 ```
 
-화면에 보이는 것: compose 에 정의된 VPN 목록, 켜기·끄기 버튼, 상태(연결됨 / 연결 중 / 실패와 사유 / 꺼짐),
+화면에 보이는 것: VPN 목록(`docker-compose.yml` 에 적힌 것 + 웹에서 올린 것), 켜기·끄기 버튼, 상태(연결됨 / 연결 중 / 실패와 사유 / 꺼짐),
 SOCKS5 주소·포트, ovpn 폴더와 `.ovpn` 파일 수, 최근 로그 40줄.
 
 VPN 카드의 제목은 그 폴더에 넣은 `.ovpn` 파일 이름(확장자 뺌)이고, 부제는 그 ovpn 이 접속하는 서버
@@ -96,17 +96,51 @@ VPN 카드의 제목은 그 폴더에 넣은 `.ovpn` 파일 이름(확장자 뺌
 
 - 켜기 = `docker compose up -d --no-build <서비스>`, 끄기 = `docker compose stop <서비스>`.
 - 실패한 VPN 은 컨테이너가 10초마다 다시 시도한다. 멈추려면 끄기를 누른다.
-- ovpn 은 올릴 수 없다. `ovpn/<이름>/` 폴더에 직접 넣는다. ovpn 검사는 컨테이너가 시작할 때 그대로 돌고,
-  거부되면 화면에 '실패'와 사유가 뜬다.
-- VPN 을 늘리려면 compose 에 서비스를 추가한다("VPN 추가"). 화면은 compose 를 읽어 목록을 만든다.
+- VPN 을 늘리려면 화면 아래 'VPN 추가'에서 `.ovpn` 을 올린다(아래 "웹에서 VPN 추가").
+- ovpn 검사는 올릴 때 한 번, 컨테이너가 시작할 때 또 한 번 돈다. 거부되면 사유(줄 번호)가 화면에 뜬다.
+
+### 웹에서 VPN 추가
+
+1. 화면 아래 'VPN 추가'에서 `.ovpn` 파일을 고른다(256KB 까지).
+2. 이름을 적는다 — 소문자·숫자·`-` 로 1~24자(예: `office`). 파일 이름에서 자동으로 채워진다.
+3. ovpn 에 `auth-user-pass` 줄이 있으면 아이디·비밀번호를 적는다. 없으면 비워 둔다.
+4. '올리기'를 누른다. 등록되면 목록에 새 카드가 생기고 SOCKS5 포트가 배정된다. '켜기'를 누르면 연결한다.
+
+일어나는 일:
+
+- 저장: `ovpn/<이름>/<이름>.ovpn`(권한 0600, 폴더 0700). 아이디·비밀번호는 `ovpn/<이름>/auth.txt`(0600).
+- 검사: 저장한 파일을 `rootfs/check-ovpn.sh`(컨테이너가 쓰는 그 검사)로 검사한다. 통과하지 못하면 폴더째 지우고
+  사유를 줄 번호와 함께 보여 준다("ovpn 검사" 절 참고).
+- 포트: `127.0.0.1` 의 1081~1180 중 비어 있는 가장 작은 번호. `127.0.0.1` 로만 연다.
+- 등록: 이름·포트·폴더를 `vpns.json` 에 적고, 거기서 `compose.generated.yml` 을 만든다. 두 파일 모두 git 에
+  올라가지 않고 손으로 고치지 않는다. `docker-compose.yml` 은 바뀌지 않으며 거기 적힌 `vpn-a/b/c` 는 그대로 동작한다.
+- 삭제: 올린 VPN 의 카드에서 '삭제' → '삭제 확인'. 컨테이너를 멈추고 지운 뒤 `ovpn/<이름>/` 폴더를 지운다.
+  되돌릴 수 없다. Docker 가 꺼져 있으면 지우지 않는다. `docker-compose.yml` 에 적힌 VPN 은 화면에서 지울 수 없다.
+
+받는 ovpn:
+
+- 인증서·키가 ovpn 안에 `<ca>`·`<cert>`·`<key>`·`<tls-crypt>` 블록으로 들어 있는 것. 올릴 수 있는 것은 파일 하나뿐이라
+  `ca ca.crt` 처럼 다른 파일을 가리키는 줄이 있으면 받지 않는다(그런 ovpn 은 아래 "VPN 추가(직접)" 방식으로 넣는다).
+- 아이디·비밀번호는 파일 이름 없이 `auth-user-pass` 만 적힌 것(또는 `<auth-user-pass>` 블록).
+- 이미 있는 이름·폴더(`vpn-a` 등)는 쓸 수 없다. 덮어쓰지 않는다.
+
+비밀번호와 키: 한 번 저장하면 화면·응답·로그에 다시 내보내지 않는다(화면 서버에는 그 파일을 읽어 돌려주는 코드가 없다).
+바꾸려면 지우고 다시 올린다.
+
+터미널에서 올린 VPN 까지 함께 다루려면 생성 파일을 같이 넘긴다:
+
+```sh
+docker compose -f docker-compose.yml -f compose.generated.yml ps
+```
 
 지키는 것:
 
 - `127.0.0.1` 에만 연다. 주소는 바꿀 수 없고 포트만 바꾼다. 로그인은 없다 — 이 Mac 의 사용자만 쓴다고 본다.
 - 상태를 바꾸는 요청은 POST 뿐이고, 이 화면 자신이 보낸 것(Origin·Host 가 `127.0.0.1`/`localhost` 의 그 포트)만 받는다.
   다른 웹사이트가 브라우저를 시켜 VPN 을 켜고 끌 수 없다.
-- 다룰 수 있는 대상은 compose 에 정의된 서비스뿐이다.
-- ovpn·`auth.txt` 의 내용은 읽지 않는다. 로그는 알려진 모양(`password=…`, `Authorization: …`, 주소 안의 비밀번호, 인증서·키 본문 등)만 가린다. 모든 비밀을 찾아내지는 못하므로 화면을 공유할 때는 로그를 접어 둔다.
+- 켜고 끌 수 있는 대상은 compose 에 정의된 서비스뿐이고, 지울 수 있는 대상은 웹에서 올린 것뿐이다.
+- 올리기·삭제도 같은 검사(POST, Origin·Host)를 거친다. 다른 웹사이트가 ovpn 을 올리거나 지울 수 없다.
+- ovpn 에서는 접속 서버(`remote`·`port`·`proto`)만 읽고, `auth.txt` 는 읽지 않는다. 로그는 알려진 모양(`password=…`, `Authorization: …`, 주소 안의 비밀번호, 인증서·키 본문 등)만 가린다. 모든 비밀을 찾아내지는 못하므로 화면을 공유할 때는 로그를 접어 둔다.
 
 시험: `python3 tests/gui_test.py` (진짜 docker 를 부르지 않는다).
 
@@ -173,7 +207,10 @@ docker exec vpn-proxy-a ip route                      # VPN 이 내려 준 경�
 컨테이너에는 임의 패킷을 만드는 권한(NET_RAW)을 주지 않았다. ping 은 되지만 `traceroute`, `nmap -sS`
 처럼 직접 패킷을 만드는 도구는 안 된다. 경로는 `ip route` 로 본다.
 
-## VPN 추가
+## VPN 추가(직접)
+
+보통은 웹 화면에서 올린다("웹에서 VPN 추가"). 인증서·키가 따로 떨어진 파일인 ovpn 처럼 화면으로 올릴 수 없는 것은
+손으로 넣는다.
 
 1. `ovpn/vpn-d/` 폴더를 만들고 `.ovpn` 을 넣는다.
 2. `docker-compose.yml` 맨 아래에 블록을 하나 더 붙인다. 이름·폴더·포트 세 곳만 다르다.
@@ -335,6 +372,10 @@ docker compose build && sh tests/smoke.sh
 
 ```
 docker-compose.yml     VPN 3개 서비스(늘리기 쉽게 공통 블록 사용)
+gui/server.py          웹 화면 서버(목록·상태·켜기·끄기·올리기·삭제)
+gui/vpnstore.py        웹에서 올린 VPN 의 저장·검사·등록부
+vpns.json              웹에서 올린 VPN 의 이름·포트·폴더(git 제외, 자동 생성)
+compose.generated.yml  vpns.json 에서 만든 compose 서비스(git 제외, 자동 생성)
 Dockerfile             alpine + openvpn + dante(SOCKS5) + iptables
 rootfs/entrypoint.sh   설정 확인 → ovpn 검사 → 방화벽 → OpenVPN → 터널 확인 → SOCKS5, 감시
 rootfs/check-ovpn.sh   ovpn 검사(허용 목록)
