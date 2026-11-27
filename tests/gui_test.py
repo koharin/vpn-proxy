@@ -847,6 +847,59 @@ class GuiTest(unittest.TestCase):
         self.assertTrue((outside / "keep.txt").exists())
         self.assertFalse((Path(self.tmp) / "ovpn" / "office").is_symlink())
 
+    def test_u1_delete_removes_only_files_the_screen_made(self):
+        """등록부를 손으로 고쳐 다른 폴더 이름을 넣어도 삭제가 그 폴더를 통째로 지우지 않는다."""
+        self.use_checker()
+        mine = self.folder("mine", {"real corp.ovpn": FAKE_OVPN, "ca.crt": "x", "notes.txt": "x"})
+        (mine / "sub").mkdir()
+        (mine / "sub" / "deep.txt").write_text("x")
+        (Path(self.tmp) / "vpns.json").write_text(json.dumps({"vpns": [{"name": "mine", "port": 1090}]}))   # imported 표시 없이 손으로 넣음
+        status, data = self.send("/api/vpns/mine/delete", {"confirm": "mine"})
+        self.assertEqual(status, 200)
+        self.assertIn("폴더는 남겼습니다", data["message"])
+        self.assertEqual(sorted(p.name for p in mine.iterdir()), ["ca.crt", "notes.txt", "real corp.ovpn", "sub"])
+        self.assertTrue((mine / "sub" / "deep.txt").exists())
+        self.assertEqual(self.manager.store.entries(), [])
+        # 화면이 올린 폴더에 다른 파일이 섞여 있으면 올린 파일만 지우고 나머지와 폴더는 남긴다
+        self.assertEqual(self.upload(ovpn=FAKE_OVPN + "auth-user-pass\n", username="u", password=PW_MARK)[0], 200)
+        office = Path(self.tmp) / "ovpn" / "office"
+        (office / "keep.txt").write_text("x")
+        self.assertIn("폴더는 남겼습니다", self.send("/api/vpns/office/delete", {"confirm": "office"})[1]["message"])
+        self.assertEqual([p.name for p in office.iterdir()], ["keep.txt"])
+        src = (REPO / "gui" / "vpnstore.py").read_text()
+        self.assertEqual(src.count("rmtree"), 1)   # 통째로 지우는 곳은 방금 만든 폴더를 되돌릴 때 한 곳뿐
+
+    def test_u2_registry_and_compose_change_together(self):
+        self.use_checker()
+        self.assertEqual(self.upload("first")[0], 200)
+        before = (Path(self.tmp) / "vpns.json").read_text(), (Path(self.tmp) / "compose.generated.yml").read_text()
+        store = self.manager.store
+        real = store._write
+
+        def failing(name, text):
+            if name == gui.vpnstore.GENERATED:
+                raise OSError(28, "No space left on device")
+            return real(name, text)
+
+        store._write = failing
+        status, data = self.upload("second")
+        self.assertEqual((status, data["ok"]), (409, False))
+        self.assertIn("파일을 쓰지 못했습니다", data["message"])
+        self.assertEqual(((Path(self.tmp) / "vpns.json").read_text(), (Path(self.tmp) / "compose.generated.yml").read_text()), before)
+        self.assertFalse((Path(self.tmp) / "ovpn" / "second").exists())
+        self.assertEqual(self.send("/api/vpns/first/delete", {"confirm": "first"})[0], 409)   # 삭제도 반쯤 되지 않는다
+        self.assertEqual((Path(self.tmp) / "vpns.json").read_text(), before[0])
+        self.assertTrue((Path(self.tmp) / "ovpn" / "first" / "first.ovpn").exists())
+        store._write = real
+        # 등록부가 아직 없을 때 실패하면 등록부를 남기지 않는다
+        fresh = gui.vpnstore.Store(Path(self.tmp) / "fresh")
+        (Path(self.tmp) / "fresh").mkdir()
+        real2 = fresh._write
+        fresh._write = lambda name, text: (_ for _ in ()).throw(OSError(28, "x")) if name == gui.vpnstore.GENERATED else real2(name, text)
+        with self.assertRaises(OSError):
+            fresh.save([{"name": "a", "port": 1081}])
+        self.assertFalse((Path(self.tmp) / "fresh" / "vpns.json").exists())
+
     def test_registry_file_is_not_trusted(self):
         self.use_checker()
         bad = {"vpns": [{"name": "../../etc", "port": 1084}, {"name": "ok", "port": 80}, {"name": "ok2", "port": "1084"},
@@ -1024,8 +1077,9 @@ class GuiTest(unittest.TestCase):
         self.assertEqual(src.count("read_bytes"), 1)  # 정적 파일 한 곳뿐
         # 등록부 모듈: 셸을 거치지 않고, 읽는 파일은 등록부(vpns.json) 하나뿐이다(ovpn·auth 는 쓰기만 한다)
         store = (REPO / "gui" / "vpnstore.py").read_text()
-        for bad in ("shell=True", "os.system", "read_bytes", "print("):
+        for bad in ("shell=True", "os.system", "print("):
             self.assertNotIn(bad, store)
+        self.assertEqual(store.count("read_bytes"), 1)   # 등록부를 되돌리려고 읽는 한 곳(ovpn·auth 는 읽지 않는다)
         self.assertEqual(store.count("read_text"), 1)
         ctl = (REPO / "gui" / "vpnctl.py").read_text()
         for bad in ("shell=True", "os.system", "read_text", "read_bytes", "open("):

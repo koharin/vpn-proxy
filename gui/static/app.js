@@ -77,8 +77,8 @@ function card(p, dockerOk) {
     const row = el("p", "row danger");
     if (asking.has(p.id)) {
       row.append(el("span", "", p.imported
-        ? "컨테이너를 멈추고 등록을 지웁니다. 직접 넣은 폴더(" + (p.folder || p.id) + ")는 남깁니다."
-        : "컨테이너를 멈추고 ovpn 폴더(" + (p.folder || p.id) + ")를 지웁니다. 되돌릴 수 없습니다."));
+        ? "컨테이너를 멈추고 등록만 지웁니다. 직접 넣은 폴더(" + (p.folder || p.id) + ")와 그 안의 .ovpn 원본은 지우지 않습니다."
+        : "컨테이너를 멈추고 올린 .ovpn 과 아이디·비밀번호 파일(" + (p.folder || p.id) + ")을 지웁니다. 되돌릴 수 없습니다."));
       const yes = el("button", "del", "삭제 확인");
       yes.type = "button";
       yes.disabled = !dockerOk || busy.has(p.id);

@@ -508,7 +508,7 @@ class Manager:
                 return False, "등록을 지우지 못했습니다."
             if entry["imported"]:
                 return True, f"등록을 지웠습니다. 직접 넣은 폴더 ovpn/{name} 는 그대로 두었습니다."
-            return True, "지웠습니다." if gone else "등록은 지웠지만 폴더가 남았습니다. ovpn/ 아래를 직접 확인하세요."
+            return True, "지웠습니다." if gone else f"등록과 올린 파일은 지웠지만 ovpn/{name} 폴더에 화면이 만들지 않은 파일이 있어 폴더는 남겼습니다."
         finally:
             self._lock.release()
             self._forget_all()

@@ -201,8 +201,25 @@ class Store:
             if e.get("imported"):
                 row["imported"] = True
             rows.append(row)
-        self._write(REGISTRY, json.dumps({"vpns": rows}, ensure_ascii=False, indent=2) + "\n")
-        self._write(GENERATED, json.dumps({"services": {e["name"]: self.service(e) for e in entries}}, indent=2) + "\n")
+        registry = json.dumps({"vpns": rows}, ensure_ascii=False, indent=2) + "\n"
+        generated = json.dumps({"services": {e["name"]: self.service(e) for e in entries}}, indent=2) + "\n"
+        # 둘은 함께 바뀌어야 한다. 한쪽이 실패하면 먼저 쓴 등록부를 이전 내용으로 되돌린다(보안 검토 U2).
+        try:
+            before = (self.root / REGISTRY).read_bytes()
+        except OSError:
+            before = None
+        self._write(REGISTRY, registry)
+        try:
+            self._write(GENERATED, generated)
+        except BaseException:
+            try:
+                if before is None:
+                    os.unlink(self.root / REGISTRY)
+                else:
+                    self._write(REGISTRY, before.decode("utf-8", "replace"))
+            except OSError:
+                pass
+            raise
 
     # ── 검사 ────────────────────────────────────────────────────────────────
     def check(self, path, clean=lambda s: s):
@@ -400,7 +417,11 @@ class Store:
         return True
 
     def remove(self, name):
-        """등록부에서 빼고 ovpn/<이름> 폴더를 지운다. 가져온 폴더(직접 넣은 것)는 남긴다. 폴더가 없어졌으면 True."""
+        """등록부에서 빼고 ovpn/<이름> 폴더를 지운다. 가져온 폴더(직접 넣은 것)는 남긴다. 폴더가 없어졌으면 True.
+
+        폴더에서는 화면이 만든 파일(<이름>.ovpn, auth.txt, 교체 중 임시 파일)만 지운다. 그 밖의 파일이 있으면
+        그 파일과 폴더는 남긴다 — 등록부를 손으로 고쳐 다른 폴더 이름을 넣어도 통째로 지우지 않는다(보안 검토 U1).
+        """
         folder = self._folder(name)
         entry = next((e for e in self.entries() if e["name"] == name), None)
         if entry is None:
@@ -411,5 +432,12 @@ class Store:
         if folder.is_symlink():
             os.unlink(folder)  # 링크가 가리키는 곳은 건드리지 않는다
         elif folder.is_dir():
-            shutil.rmtree(folder, ignore_errors=True)
+            for mine in (name + ".ovpn", AUTH_FILE, UPLOAD_TMP):
+                path = folder / mine
+                if path.is_symlink() or path.is_file():
+                    os.unlink(path)
+            try:
+                os.rmdir(folder)  # 비었을 때만 지워진다
+            except OSError:
+                pass
         return not folder.exists()
